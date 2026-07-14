@@ -1,0 +1,13 @@
+.git
+.agents
+.codex
+data/
+server
+webhook
+deploy/
+docs/
+insatll.md
+*.md
+.env
+.idea/
+.vscode/

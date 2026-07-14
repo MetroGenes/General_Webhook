@@ -1,0 +1,124 @@
+server:
+  addr: ":8080"
+  # 标准部署没有入站反代，保持未配置。仅在批准的内部 relay 使用固定地址时，
+  # 才填写该 relay 的精确 IP/CIDR，不要直接信任整个私网网段。
+  # trusted_proxies:
+  #   - "172.30.0.10/32"
+
+log:
+  level: "info"          # debug | info | warn | error
+
+store:
+  path: "data/webhook.db"
+  retention: 720h
+  retain_payload: true
+
+queue:
+  workers: 4
+  buffer: 256
+  max_retries: 3
+
+sources:
+  # 示例 1: 内部 relay 转发的 GitHub push, HMAC 校验, 通知飞书 + 转发自定义服务
+  # 默认 Docker 部署不接受公网 GitHub 直连，也不要为此添加宿主端口。
+  - name: github
+    auth:
+      type: hmac
+      header: X-Hub-Signature-256
+      secret: ${GITHUB_SECRET}
+    extract:                       # 变量名 -> JSONPath
+      event:  "$.action"
+      branch: "$.ref"
+      repo:   "$.repository.full_name"
+    rules:                         # 全部命中才触发 (正则)
+      - var: branch
+        regex: "refs/heads/(main|master)"
+    actions:
+      # 飞书群机器人
+      - type: http
+        url: ${FEISHU_BOT}
+        method: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "msg_type": "text",
+            "content": {
+              "text": "🚀 ${repo} pushed to ${branch}"
+            }
+          }
+      # 转发到 n8n 工作流
+      - type: http
+        url: "https://n8n.local/webhook/deploy"
+        method: POST
+        body: |
+          {
+            "event": "${event}",
+            "branch": "${branch}",
+            "repo": "${repo}"
+          }
+
+  # 示例 2: 批准的同网络容器, token 校验, 执行镜像内脚本
+  - name: custom
+    auth:
+      type: token
+      header: X-Webhook-Token
+      secret: ${CUSTOM_TOKEN}
+    extract:
+      job: "$.job"
+    rules: []                      # 空 = 总是触发
+    actions:
+      - type: exec
+        command: "/opt/general-webhook/scripts/run.sh"
+        args: ["${job}"]
+        timeout: 300s
+
+  # 示例 3: 宝塔面板告警 -> Telegram bot
+  # 同一受控 Docker 网络内的宝塔/relay「告警 -> 自定义消息通道」配置:
+  #   请求URL: http://general-webhook:8080/webhook/bt
+  #   请求头: {"X-Webhook-Token": "<BT_TOKEN 的值>"}
+  #   请求体: 保持默认 {"title":"$title","msg":"$msg","type":"$type"}
+  # 公网宝塔不能直接调用默认部署，必须经独立内部 relay；禁止添加 ports 或公网反代。
+  # 若 Telegram action 需要出站代理，只改下面的目标 url；这不是 Webhook 入站反代。
+  - name: bt
+    auth:
+      type: token
+      header: X-Webhook-Token
+      secret: ${BT_TOKEN}
+    extract:                       # 对应宝塔的 $title/$msg/$type
+      title: "$.title"
+      msg:   "$.msg"
+      type:  "$.type"
+    rules: []                      # 空 = 所有告警都转发
+    actions:
+      - type: http
+        url: "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
+        method: POST
+        headers:
+          Content-Type: application/json
+        body: |
+          {
+            "chat_id": "${TG_CHAT_ID}",
+            "text": "🛎 宝塔告警 [${type}]\n${title}\n${msg}"
+          }
+
+  # 示例 4: 钉钉群机器人 (演示其他 IM 渠道)
+  - name: dingtalk-demo
+    auth:
+      type: token
+      header: X-Webhook-Token
+      secret: ${DINGTALK_WEBHOOK_TOKEN}
+    extract:
+      message: "$.message"
+    rules: []
+    actions:
+      - type: http
+        url: "https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}"
+        method: POST
+        body: |
+          {
+            "msgtype": "text",
+            "text": {
+              "content": "${message}"
+            }
+          }

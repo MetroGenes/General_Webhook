@@ -1,0 +1,53 @@
+[Unit]
+# Legacy fallback only. Production deployment uses Dockerfile + docker-compose.yaml.
+Description=General Webhook Gateway (legacy systemd fallback)
+Documentation=file:/opt/general-webhook/INSTALL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 专用非 root 用户运行 (需先 useradd: useradd -r -s /usr/sbin/nologin webhook)
+User=webhook
+Group=webhook
+
+# 部署目录约定: 二进制 + configs/ + data/ + scripts/ 都在此
+WorkingDirectory=/opt/general-webhook
+ExecStart=/opt/general-webhook/webhook -config /opt/general-webhook/configs/webhooks.yaml
+
+# secret 走独立环境变量文件 (chmod 600), 不写进 service / 仓库
+EnvironmentFile=/opt/general-webhook/general-webhook.env
+
+# 内存封顶: GOMEMLIMIT 软上限触发 GC, MemoryMax 硬隔离 OOM kill
+Environment=GOMEMLIMIT=64MiB
+Environment=GOGC=50
+MemoryMax=80M
+
+# 异常自动重启
+Restart=on-failure
+RestartSec=3s
+
+# 优雅关停: 对齐应用总关停预算 35s，留余量
+KillSignal=SIGTERM
+TimeoutStopSec=45s
+
+# 日志走 journald (应用只写 stdout JSON)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=general-webhook
+
+# --- 安全加固 ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 仅允许写 SQLite 审计库目录; 其余文件系统只读
+ReadWritePaths=/opt/general-webhook/data
+
+[Install]
+WantedBy=multi-user.target

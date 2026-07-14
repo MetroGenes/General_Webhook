@@ -1,0 +1,82 @@
+name: general-webhook
+
+services:
+  webhook:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        WEBHOOK_UID: ${WEBHOOK_UID:-10001}
+        WEBHOOK_GID: ${WEBHOOK_GID:-10001}
+    image: ${WEBHOOK_IMAGE:?set WEBHOOK_IMAGE to a unique version tag}
+    user: "${WEBHOOK_UID:-10001}:${WEBHOOK_GID:-10001}"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
+    cpus: "${WEBHOOK_CPU_LIMIT:-0.50}"
+    mem_limit: "${WEBHOOK_MEMORY_LIMIT:-256m}"
+    memswap_limit: "${WEBHOOK_MEMORY_SWAP_LIMIT:-256m}"
+    mem_reservation: "${WEBHOOK_MEMORY_RESERVATION:-64m}"
+    pids_limit: ${WEBHOOK_PIDS_LIMIT:-64}
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m,mode=1777
+    expose:
+      - "8080"
+    ulimits:
+      nofile:
+        soft: 2048
+        hard: 4096
+    volumes:
+      - type: bind
+        source: ${WEBHOOK_DATA_DIR:?set WEBHOOK_DATA_DIR to a pre-created host directory}
+        target: /app/data
+        bind:
+          create_host_path: false
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      GOMEMLIMIT: ${WEBHOOK_GOMEMLIMIT:-192MiB}
+      GOGC: ${WEBHOOK_GOGC:-50}
+      GITHUB_SECRET: ${GITHUB_SECRET:-}
+      FEISHU_BOT: ${FEISHU_BOT:-}
+      CUSTOM_TOKEN: ${CUSTOM_TOKEN:-}
+      BT_TOKEN: ${BT_TOKEN:-}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN:-}
+      TG_CHAT_ID: ${TG_CHAT_ID:-}
+      DINGTALK_TOKEN: ${DINGTALK_TOKEN:-}
+      DINGTALK_WEBHOOK_TOKEN: ${DINGTALK_WEBHOOK_TOKEN:-}
+    networks:
+      webhook-internal:
+        aliases:
+          - general-webhook
+      webhook-egress:
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  # Pre-create with:
+  # docker network create --driver bridge --internal webhook-internal
+  # If it already exists, verify docker network inspect reports Internal=true.
+  # Only explicitly approved producer containers should join it.
+  webhook-internal:
+    name: ${WEBHOOK_INTERNAL_NETWORK:-webhook-internal}
+    external: true
+
+  # Webhook joins this separate network only for outbound HTTP actions.
+  # No other application should normally join it.
+  webhook-egress:
+    name: ${WEBHOOK_EGRESS_NETWORK:-webhook-egress}
+    driver: bridge
