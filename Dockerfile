@@ -1,11 +1,13 @@
-FROM golang:1.26.5-alpine AS build
+# golang:1.26.5-alpine index digest (multi-arch); pin the build toolchain too.
+FROM golang:1.26.5-alpine@sha256:0178a641fbb4858c5f1b48e34bdaabe0350a330a1b1149aabd498d0699ff5fb2 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/webhook ./cmd/server
 
-FROM alpine:3.22
+# alpine:3.22 index digest (multi-arch); pin to avoid floating tag drift
+FROM alpine:3.22@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
 ARG WEBHOOK_UID=10001
 ARG WEBHOOK_GID=10001
 RUN apk add --no-cache ca-certificates tzdata \

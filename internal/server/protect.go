@@ -9,9 +9,8 @@ import (
 )
 
 const (
-	maxLimiterBuckets       = 4096
-	maxDeliveryCacheEntries = 4096
-	bucketIdleTTL           = 30 * time.Minute
+	maxLimiterBuckets = 4096
+	bucketIdleTTL     = 30 * time.Minute
 )
 
 // rateLimiter is a per-key token bucket with TTL eviction and capacity cap.
@@ -99,69 +98,6 @@ func (r *rateLimiter) lenBuckets() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return len(r.buckets)
-}
-
-// deliveryCache remembers delivery IDs for a TTL window to block replays.
-type deliveryCache struct {
-	mu      sync.Mutex
-	ttl     time.Duration
-	maxKeys int
-	entries map[string]time.Time
-}
-
-func newDeliveryCache(ttl time.Duration) *deliveryCache {
-	if ttl <= 0 {
-		ttl = 10 * time.Minute
-	}
-	return &deliveryCache{
-		ttl:     ttl,
-		maxKeys: maxDeliveryCacheEntries,
-		entries: make(map[string]time.Time),
-	}
-}
-
-func (c *deliveryCache) claim(id string, now time.Time) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.purge(now)
-	if exp, ok := c.entries[id]; ok && now.Before(exp) {
-		return false
-	}
-	if len(c.entries) >= c.maxKeys {
-		c.evictOne()
-	}
-	c.entries[id] = now.Add(c.ttl)
-	return true
-}
-
-func (c *deliveryCache) purge(now time.Time) {
-	for id, exp := range c.entries {
-		if !now.Before(exp) {
-			delete(c.entries, id)
-		}
-	}
-}
-
-func (c *deliveryCache) evictOne() {
-	var oldestKey string
-	var oldest time.Time
-	first := true
-	for k, exp := range c.entries {
-		if first || exp.Before(oldest) {
-			oldestKey = k
-			oldest = exp
-			first = false
-		}
-	}
-	if oldestKey != "" {
-		delete(c.entries, oldestKey)
-	}
-}
-
-func (c *deliveryCache) lenEntries() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return len(c.entries)
 }
 
 type trustedNets struct {

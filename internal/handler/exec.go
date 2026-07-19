@@ -32,6 +32,10 @@ func NewExec() *Exec {
 func (h *Exec) Type() string { return "exec" }
 
 func (h *Exec) Handle(ctx context.Context, ac config.ActionConfig, vars map[string]string) (Result, error) {
+	secretFields := append([]string{ac.Command}, ac.Args...)
+	if missing := missingExplicitSecret(secretFields...); missing != "" {
+		return Result{}, fmt.Errorf("%w: required action secret %s is not set", ErrNonRetryable, missing)
+	}
 	if ac.Command == "" {
 		return Result{}, fmt.Errorf("exec: empty command")
 	}

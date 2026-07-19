@@ -2,15 +2,18 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +40,7 @@ func TestWebhook_OutboxAcceptsWhenWakeBufferFull(t *testing.T) {
 	}
 	retain := true
 	cfg.Store.RetainPayload = &retain
-	q := queue.New(config.QueueConfig{Workers: 1, Buffer: 1, MaxRetries: 1}, handler.NewRegistry(), st, cfg)
+	q := queue.New(config.QueueConfig{Workers: 1, Buffer: 1, MaxRetries: 1}, handler.NewRegistry(), st, cfg, "owner-1")
 	srv := New(cfg, q, st)
 
 	req := httptest.NewRequest(http.MethodPost, "/webhook/test", bytes.NewReader([]byte(`{}`)))
@@ -60,7 +63,7 @@ func TestWebhook_OutboxAcceptsWhenWakeBufferFull(t *testing.T) {
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(status), '') FROM events`).Scan(&count, &status); err != nil {
 		t.Fatalf("query events: %v", err)
 	}
-	if count != 1 || (status != "pending" && status != "processing" && status != "done" && status != "skipped" && status != "partial" && status != "error") {
+	if count != 1 || (status != "pending" && status != "processing" && status != "retrying" && status != "dead" && status != "done" && status != "skipped" && status != "partial" && status != "error") {
 		t.Fatalf("persisted event count/status = %d/%q", count, status)
 	}
 }
@@ -88,7 +91,7 @@ func TestWebhook_RejectsInvalidJSON(t *testing.T) {
 }
 
 func TestWebhook_RejectsDuplicateDelivery(t *testing.T) {
-	secret := "s3cret"
+	secret := "s3cret-sixteen!!"
 	srv := newTestServer(t, config.AuthConfig{
 		Type:   "hmac",
 		Header: "X-Hub-Signature-256",
@@ -129,8 +132,8 @@ func TestWebhook_RejectsDuplicateDelivery(t *testing.T) {
 	}
 }
 
-func TestWebhook_AllowsDistinctDeliverySameHMACBody(t *testing.T) {
-	secret := "s3cret"
+func TestWebhook_RejectsDuplicateHMACBodyDifferentDelivery(t *testing.T) {
+	secret := "s3cret-sixteen!!"
 	srv := newTestServer(t, config.AuthConfig{
 		Type:   "hmac",
 		Header: "X-Hub-Signature-256",
@@ -142,7 +145,7 @@ func TestWebhook_AllowsDistinctDeliverySameHMACBody(t *testing.T) {
 	body := []byte(`{"ok":true}`)
 	sign := "sha256=" + hmacHex(secret, body)
 
-	for _, id := range []string{"deliv-a", "deliv-b"} {
+	for i, id := range []string{"deliv-a", "deliv-b"} {
 		req := httptest.NewRequest(http.MethodPost, "/webhook/test", bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Hub-Signature-256", sign)
@@ -150,14 +153,48 @@ func TestWebhook_AllowsDistinctDeliverySameHMACBody(t *testing.T) {
 		req.Header.Set("X-Webhook-Timestamp", strconv.FormatInt(fixed.Unix(), 10))
 		rec := httptest.NewRecorder()
 		srv.Handler().ServeHTTP(rec, req)
-		if rec.Code != http.StatusAccepted {
-			t.Fatalf("delivery %s = %d, want accepted", id, rec.Code)
+		if i == 0 {
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("first delivery = %d, want accepted", rec.Code)
+			}
+			continue
+		}
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("same body different delivery = %d, want conflict", rec.Code)
 		}
 	}
 }
 
+func TestWebhook_BoundHMAC(t *testing.T) {
+	secret := "s3cret-sixteen!!"
+	srv := newTestServer(t, config.AuthConfig{
+		Type:          "hmac",
+		Header:        "X-Hub-Signature-256",
+		Secret:        secret,
+		SignedHeaders: []string{"timestamp", "delivery_id", "body"},
+	}, 8)
+	fixed := time.Unix(1_700_000_000, 0)
+	srv.now = func() time.Time { return fixed }
+
+	body := []byte(`{"ok":true}`)
+	ts := strconv.FormatInt(fixed.Unix(), 10)
+	payload := ts + "\n" + "deliv-bound" + "\n" + string(body)
+	sign := "sha256=" + hmacHex(secret, []byte(payload))
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/test", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hub-Signature-256", sign)
+	req.Header.Set("X-Delivery-Id", "deliv-bound")
+	req.Header.Set("X-Webhook-Timestamp", ts)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 func TestWebhook_RejectsStaleTimestamp(t *testing.T) {
-	secret := "s3cret"
+	secret := "s3cret-sixteen!!"
 	srv := newTestServer(t, config.AuthConfig{
 		Type:   "hmac",
 		Header: "X-Hub-Signature-256",
@@ -193,12 +230,10 @@ func TestWebhook_IgnoresSpoofedXFFWithoutTrustedProxy(t *testing.T) {
 			t.Fatalf("unexpected rate limit at %d", i)
 		}
 	}
-	// same remote should eventually hit per-source limiter after auth
 	req := httptest.NewRequest(http.MethodPost, "/webhook/test", bytes.NewReader([]byte(`{}`)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Forwarded-For", "10.0.0.99")
 	req.RemoteAddr = "192.0.2.10:12345"
-	// burn remaining tokens quickly by reusing same source|ip
 	limited := false
 	for i := 0; i < 50; i++ {
 		rec := httptest.NewRecorder()
@@ -246,6 +281,130 @@ func TestHealthzAndReadyz(t *testing.T) {
 	}
 }
 
+func TestOpsEndpoints(t *testing.T) {
+	srv := newTestServer(t, config.AuthConfig{Type: "none"}, 8)
+	req := httptest.NewRequest(http.MethodPost, "/webhook/test", bytes.NewReader([]byte(`{"x":1}`)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("accept = %d", rec.Code)
+	}
+	var resp map[string]string
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	id := resp["event_id"]
+
+	recStats := httptest.NewRecorder()
+	unauthorized := httptest.NewRequest(http.MethodGet, "/queue/stats", nil)
+	srv.Handler().ServeHTTP(recStats, unauthorized)
+	if recStats.Code != http.StatusUnauthorized {
+		t.Fatalf("stats without admin token = %d", recStats.Code)
+	}
+	recStats = httptest.NewRecorder()
+	statsReq := adminRequest(http.MethodGet, "/queue/stats", nil)
+	srv.Handler().ServeHTTP(recStats, statsReq)
+	if recStats.Code != http.StatusOK {
+		t.Fatalf("stats = %d", recStats.Code)
+	}
+	recEv := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recEv, adminRequest(http.MethodGet, "/events/"+id, nil))
+	if recEv.Code != http.StatusOK {
+		t.Fatalf("get event = %d body=%s", recEv.Code, recEv.Body.String())
+	}
+	recMetrics := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(recMetrics, adminRequest(http.MethodGet, "/metrics", nil))
+	if recMetrics.Code != http.StatusOK || !strings.Contains(recMetrics.Body.String(), "general_webhook_events") {
+		t.Fatalf("metrics = %d %q", recMetrics.Code, recMetrics.Body.String())
+	}
+	if !strings.Contains(recMetrics.Body.String(), "general_webhook_action_failure_ratio") {
+		t.Fatalf("metrics missing action failure ratio: %q", recMetrics.Body.String())
+	}
+}
+
+func TestRetryEvent_ReplaysOnlyDeadActionsAndRecordsReason(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "webhook.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	src := config.Source{
+		Name: "test", Auth: config.AuthConfig{Type: "none"},
+		Actions: []config.ActionConfig{{Type: "exec", Command: "/bin/true"}, {Type: "exec", Command: "/bin/false"}},
+	}
+	cfg := &config.Config{
+		Admin:   config.AdminConfig{Header: "Authorization", Token: "admin-token-123456789"},
+		Sources: []config.Source{src},
+	}
+	snapshot, err := config.SnapshotSource(&src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Truncate(time.Millisecond)
+	if err := st.SavePendingEvent(context.Background(), "dead-event", src.Name, "", []byte(`{}`), now, "", "", "hash", snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if ev, err := st.ClaimPending(context.Background(), time.Minute, now, "owner"); err != nil || ev == nil {
+		t.Fatalf("claim=%+v err=%v", ev, err)
+	}
+	if err := st.PrepareEvent(context.Background(), "dead-event", `{}`, 2, true, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.StartAction(context.Background(), "dead-event", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CompleteAction(context.Background(), "dead-event", 0, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.StartAction(context.Background(), "dead-event", 1, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeadAction(context.Background(), "dead-event", 1, "downstream unavailable", now); err != nil {
+		t.Fatal(err)
+	}
+	if status, err := st.RefreshEventStatus(context.Background(), "dead-event", now); err != nil || status != "dead" {
+		t.Fatalf("status=%q err=%v", status, err)
+	}
+
+	q := queue.New(config.QueueConfig{Workers: 1, Buffer: 1}, handler.NewRegistry(), st, cfg, "owner")
+	srv := New(cfg, q, st)
+	body := bytes.NewReader([]byte(`{"reason":"downstream recovered"}`))
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, adminRequest(http.MethodPost, "/events/dead-event/retry", body))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil || response["generation"] != float64(1) {
+		t.Fatalf("response=%v err=%v", response, err)
+	}
+	states, err := st.ListActionStates(context.Background(), "dead-event")
+	if err != nil || len(states) != 2 || states[0].Status != "done" || states[1].Status != "pending" {
+		t.Fatalf("states=%+v err=%v", states, err)
+	}
+	meta, err := st.GetEvent(context.Background(), "dead-event")
+	if err != nil || meta.ReplayReason != "downstream recovered" || meta.ReplayGeneration != 1 {
+		t.Fatalf("meta=%+v err=%v", meta, err)
+	}
+}
+
+func TestOpsRoutesAbsentWithoutAdminToken(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "webhook.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	cfg := &config.Config{}
+	q := queue.New(config.QueueConfig{Workers: 1, Buffer: 1}, handler.NewRegistry(), st, cfg, "owner")
+	srv := New(cfg, q, st)
+	for _, path := range []string{"/events/id", "/queue/stats", "/metrics"} {
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status=%d, want 404", path, rec.Code)
+		}
+	}
+}
+
 func TestClientIP_TrustedProxy(t *testing.T) {
 	trusted := parseTrustedProxies([]string{"10.0.0.0/8"})
 	req := httptest.NewRequest(http.MethodPost, "/", nil)
@@ -272,6 +431,7 @@ func newTestServer(t *testing.T, authCfg config.AuthConfig, buffer int) *Server 
 	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := &config.Config{
+		Admin: config.AdminConfig{Header: "Authorization", Token: "admin-token-123456789"},
 		Sources: []config.Source{{
 			Name:    "test",
 			Auth:    authCfg,
@@ -280,8 +440,28 @@ func newTestServer(t *testing.T, authCfg config.AuthConfig, buffer int) *Server 
 	}
 	retain := true
 	cfg.Store.RetainPayload = &retain
-	q := queue.New(config.QueueConfig{Workers: 1, Buffer: buffer, MaxRetries: 1}, handler.NewRegistry(), st, cfg)
+	cfg.Server.MaxInFlight = 16
+	cfg.Server.MaxInFlightBytes = 32 << 20
+	q := queue.New(config.QueueConfig{Workers: 1, Buffer: buffer, MaxRetries: 1}, handler.NewRegistry(), st, cfg, "owner-1")
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	q.Start(workerCtx)
+	t.Cleanup(func() {
+		cancelWorker()
+		stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = q.Stop(stopCtx)
+	})
 	return New(cfg, q, st)
+}
+
+func adminRequest(method, target string, body *bytes.Reader) *http.Request {
+	var reader io.Reader
+	if body != nil {
+		reader = body
+	}
+	req := httptest.NewRequest(method, target, reader)
+	req.Header.Set("Authorization", "Bearer admin-token-123456789")
+	return req
 }
 
 func hmacHex(secret string, body []byte) string {

@@ -1,6 +1,6 @@
 # General Webhook 部署指南
 
-本项目的标准生产部署只通过 Dockerfile 构建镜像，并使用 Docker Compose 运行。裸机二进制和 systemd 文件仅为历史兼容保留，不属于新部署路径。
+本项目的**唯一**推荐生产部署方式：通过 Dockerfile 构建镜像，并使用 Docker Compose 运行。不支持裸机二进制、systemd 或宿主机同步脚本。
 
 ## 部署原则
 
@@ -25,7 +25,7 @@ chmod 600 .env
 
 若当前 Compose 不识别这些参数或配置字段，应先升级 Compose，不要通过删除健康等待或自动建数据目录来绕过。
 
-`.env.example` 中的 source secret 和 action token 默认留空，应用会拒绝带空 secret 的配置启动。编辑 `.env`，只填写实际启用 source 所需的值；未使用的 source 应从 `configs/webhooks.yaml` 删除并重新构建镜像。不要把 `.env` 加入镜像或版本库。
+`.env.example` 中的 source secret、action token 与 `ADMIN_TOKEN` 默认留空。编辑 `.env`，为管理接口设置至少 16 字节的独立随机 token，并只填写实际启用 source 所需的值；未使用的 source 应从 `configs/webhooks.yaml` 删除并重新构建镜像。不要复用 source token，也不要把 `.env` 加入镜像或版本库。
 
 正式发布必须使用唯一版本或提交哈希，不使用可漂移的 `latest`：
 
@@ -144,9 +144,9 @@ networks:
 
 容器还启用固定非 root 用户、只读根文件系统、`cap_drop: ALL` 和 `no-new-privileges`。exec 脚本只能写入 `/app/data` 或受限 `/tmp`；不要为了脚本方便而挂载 Docker socket、宿主根目录或任意可写目录。
 
-`webhook-egress` 只隔离网络成员，不会按域名限制出站目标。需要严格目的地白名单时，应在宿主机防火墙或专用出站代理实现。
+应用会执行 action 级 `url_allowlist`、DNS/IP 和重定向校验；`webhook-egress` 本身只隔离网络成员，不是网络层域名防火墙。需要独立于应用配置的强制出站策略时，应在宿主机防火墙或专用出站代理实现。
 
-健康检查访问 `/readyz` 并验证 SQLite 可写。`restart: unless-stopped` 只会在进程退出时重启；单纯 `unhealthy` 不会自动重启，应由监控系统告警。容器停止宽限期为 45 秒，用于完成应用最长 35 秒的关停流程。
+健康检查访问 `/readyz` 并验证 worker 存活及 SQLite 可写。`restart: unless-stopped` 只会在进程退出时重启；单纯 `unhealthy` 不会自动重启，应由监控系统告警。容器停止宽限期为 45 秒，用于完成应用最长 35 秒的关停流程。Prometheus 抓取 `/metrics` 时必须携带管理 Bearer token，并至少对 `dead/partial/error > 0`、最老未完成事件超时和 5 分钟 action 失败率设置告警。
 
 ## 8. 更新、回滚与数据
 
@@ -172,8 +172,8 @@ docker compose --env-file .env up -d --no-build --remove-orphans --wait --wait-t
 
 回滚时，把 `WEBHOOK_IMAGE` 改回仍保存在主机/镜像仓库中的上一唯一标签，再执行 `config -q` 和 `up -d --no-build --wait`。若新版本进行了旧程序不兼容的数据迁移，还必须在服务停止时恢复升级前的完整 SQLite 备份；这会丢弃备份之后收到的事件，应先评估影响。
 
+从曾经把 action URL 展开后写入 SQLite 的版本升级时，新版本会用当前环境变量把可识别凭据替换回 `${secret:NAME}` 引用，但历史备份不会被自动修改。完成升级并核验后，应轮换 Telegram、飞书、钉钉等旧 token，并按保留策略安全处理旧备份。
+
 不要执行 `docker compose down -v`。容器资源限制不限制 bind mount 的数据量，仍需监控磁盘、备份和执行 `store.retention` 保留策略。
 
-## 部署同步助手
-
-`deploy/sync-to-opt.sh` 是可选的主机准备助手：它把构建上下文同步到 `/opt/general-webhook`，创建受限数据目录，创建或验证 internal 入口网络，并打印带显式 `--env-file` 的后续 Compose 命令。它不安装或启动任何公网反向代理。
+关停语义：Compose `stop_grace_period`（默认 45s）内应用会停止接受新请求并停止认领新任务；超时取消的 in-flight 事件会回退为 `pending` 以便重启后继续处理，不会写成终态 `partial`。长耗时 `exec`（如 300s）不保证在单次关停窗口内跑完。

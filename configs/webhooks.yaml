@@ -1,9 +1,15 @@
 server:
   addr: ":8080"
+  max_in_flight: 16
+  max_in_flight_bytes: 33554432  # 32 MiB
   # 标准部署没有入站反代，保持未配置。仅在批准的内部 relay 使用固定地址时，
   # 才填写该 relay 的精确 IP/CIDR，不要直接信任整个私网网段。
   # trusted_proxies:
   #   - "172.30.0.10/32"
+
+admin:
+  header: Authorization
+  token: ${ADMIN_TOKEN}
 
 log:
   level: "info"          # debug | info | warn | error
@@ -11,16 +17,20 @@ log:
 store:
   path: "data/webhook.db"
   retention: 720h
-  retain_payload: true
+  retain_payload: false
 
 queue:
   workers: 4
   buffer: 256
-  max_retries: 3
+  max_retries: 2        # 首次尝试之后最多再重试 2 次（总计 3 次）
+  retry_base: 1s
+  max_retry_delay: 15m
+  max_retry_age: 24h
 
 sources:
   # 示例 1: 内部 relay 转发的 GitHub push, HMAC 校验, 通知飞书 + 转发自定义服务
   # 默认 Docker 部署不接受公网 GitHub 直连，也不要为此添加宿主端口。
+  # GitHub 兼容：HMAC 仅签名 body；须带 delivery id + timestamp；同 body 在 replay 窗口内去重。
   - name: github
     auth:
       type: hmac
@@ -32,12 +42,15 @@ sources:
       repo:   "$.repository.full_name"
     rules:                         # 全部命中才触发 (正则)
       - var: branch
-        regex: "refs/heads/(main|master)"
+        regex: "^refs/heads/(main|master)$"
     actions:
       # 飞书群机器人
       - type: http
-        url: ${FEISHU_BOT}
+        url: ${secret:FEISHU_BOT}
         method: POST
+        url_allowlist:
+          - "open.feishu.cn"
+          - "https://open.feishu.cn/"
         headers:
           Content-Type: application/json
         body: |
@@ -51,6 +64,9 @@ sources:
       - type: http
         url: "https://n8n.local/webhook/deploy"
         method: POST
+        allow_private: true
+        url_allowlist:
+          - "n8n.local"
         body: |
           {
             "event": "${event}",
@@ -92,13 +108,15 @@ sources:
     rules: []                      # 空 = 所有告警都转发
     actions:
       - type: http
-        url: "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
+        url: "https://api.telegram.org/bot${secret:TG_BOT_TOKEN}/sendMessage"
         method: POST
+        url_allowlist:
+          - "api.telegram.org"
         headers:
           Content-Type: application/json
         body: |
           {
-            "chat_id": "${TG_CHAT_ID}",
+            "chat_id": "${secret:TG_CHAT_ID}",
             "text": "🛎 宝塔告警 [${type}]\n${title}\n${msg}"
           }
 
@@ -113,8 +131,10 @@ sources:
     rules: []
     actions:
       - type: http
-        url: "https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}"
+        url: "https://oapi.dingtalk.com/robot/send?access_token=${secret:DINGTALK_TOKEN}"
         method: POST
+        url_allowlist:
+          - "oapi.dingtalk.com"
         body: |
           {
             "msgtype": "text",

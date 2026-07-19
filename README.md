@@ -12,7 +12,7 @@ General Webhook 是一个用 Go 编写的通用 webhook 网关。它提供统一
 - 规则过滤：对抽取变量做正则匹配，所有规则命中才执行动作。
 - 异步处理：请求写入 SQLite outbox（`pending`）后返回 `202 Accepted`，worker 认领并执行动作；进程重启可继续处理未完成任务。
 - 动作类型：通用 HTTP 请求（支持 Telegram/飞书/钉钉/自定义服务）+ 本地命令执行。
-- 审计记录：SQLite 保存事件元数据、处理状态和已脱敏的动作日志；原始 payload 是否长期保留由 `store.retain_payload` 控制。
+- 审计记录：SQLite 保存事件、每个 action 的持久重试状态、耐久化抽取变量和已脱敏动作日志；原始 payload 是否长期保留由 `store.retain_payload` 控制。
 - 结构化日志：使用标准库 `log/slog` 输出 JSON 日志，`event_id` 同时作为 `trace_id`。
 
 ## 工作流程
@@ -20,7 +20,7 @@ General Webhook 是一个用 Go 编写的通用 webhook 网关。它提供统一
 ```text
 POST /webhook/github
   -> 校验 source 是否存在
-  -> 读取并限制 body 大小，最大 5 MB
+  -> 读取并限制 body 大小，最大 1 MiB（进程级并发与在途字节预算）
   -> 按 source.auth 校验签名或 token
   -> 生成 event_id / trace_id
   -> 以 pending 状态持久化到 SQLite outbox
@@ -30,8 +30,10 @@ POST /webhook/github
 worker 异步处理
   -> 按 extract 抽取变量
   -> 按 rules 过滤事件
-  -> 依次执行 actions
-  -> 失败动作按 max_retries 线性退避重试
+  -> 命中后，同一事务持久化 vars_json 并初始化 action 状态
+  -> 逐个执行尚未成功的 actions
+  -> 失败动作写入持久 next_attempt_at，按指数退避 + full jitter 重试
+  -> Retry-After 到期前不占用 worker；超过次数/期限进入 dead letter
   -> 更新事件状态并写入 action_logs
 ```
 
@@ -39,13 +41,15 @@ worker 异步处理
 
 | 状态 | 含义 |
 | --- | --- |
-| `received` | 旧版本兼容状态；启动迁移时转为 `pending` |
+| `received` / `rejected` | 旧版本兼容状态；启动迁移时转为 `pending` |
 | `pending` | 已持久化，等待 worker 认领 |
 | `processing` | worker 已认领，执行中 |
+| `retrying` | 至少一个 action 等待持久延迟重试 |
 | `done` | 所有动作执行成功 |
-| `partial` | 至少一个动作在重试后仍失败 |
+| `dead` | 至少一个动作达到重试次数/期限或发生永久错误，可人工 replay |
 | `skipped` | 规则未命中，未执行动作 |
-| `error` | 规则匹配等系统处理过程出错 |
+
+旧数据库中的 `partial` / `error` 只作为迁移兼容状态保留。
 
 ## 项目结构
 
@@ -63,7 +67,7 @@ worker 异步处理
 │   ├── server/                     # HTTP 路由与 webhook 接入层
 │   └── store/                      # SQLite outbox、审计、保留与 payload 清理
 ├── configs/webhooks.yaml           # 示例配置
-├── deploy/                         # Docker 部署同步助手；systemd 文件仅为历史兼容
+├── deploy/                         # 部署说明（指向 Dockerfile + Compose）
 ├── scripts/run.sh                  # exec 动作示例脚本
 ├── INSTALL.md                      # Docker Compose 正式部署指南
 ├── .env.example                    # 部署参数、secret 与资源限制示例
@@ -152,8 +156,9 @@ networks:
 ```bash
 export GITHUB_SECRET='your_github_secret'
 export FEISHU_BOT='https://open.feishu.cn/open-apis/bot/v2/hook/xxx'
-export CUSTOM_TOKEN='your_token'
-export BT_TOKEN='baota_token'
+export ADMIN_TOKEN='local_admin_token_123456'
+export CUSTOM_TOKEN='local_custom_token_123456'
+export BT_TOKEN='local_baota_token_123456'
 export TG_BOT_TOKEN='123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11'
 export TG_CHAT_ID='123456789'
 export DINGTALK_TOKEN='dingtalk_access_token'
@@ -161,6 +166,8 @@ export DINGTALK_WEBHOOK_TOKEN='dingtalk_inbound_token'
 
 cp configs/webhooks.yaml /tmp/general-webhook-dev.yaml
 sed -i '0,/addr: ":8080"/s//addr: "127.0.0.1:8080"/' /tmp/general-webhook-dev.yaml
+sed -i 's#path: "data/webhook.db"#path: "/tmp/general-webhook-dev.db"#' /tmp/general-webhook-dev.yaml
+sed -i 's#/opt/general-webhook/scripts/run.sh#./scripts/run.sh#' /tmp/general-webhook-dev.yaml
 go run ./cmd/server -config /tmp/general-webhook-dev.yaml
 ```
 
@@ -170,7 +177,7 @@ go run ./cmd/server -config /tmp/general-webhook-dev.yaml
 curl http://127.0.0.1:8080/readyz
 curl -X POST 'http://127.0.0.1:8080/webhook/custom' \
   -H 'Content-Type: application/json' \
-  -H 'X-Webhook-Token: your_token' \
+  -H 'X-Webhook-Token: local_custom_token_123456' \
   -d '{"job":"deploy-api"}'
 ```
 
@@ -191,18 +198,25 @@ server:
   addr: ":8080"
   trusted_proxies: []
 
+admin:
+  header: Authorization
+  token: ${ADMIN_TOKEN}
+
 log:
   level: "info"
 
 store:
   path: "data/webhook.db"
   retention: 720h
-  retain_payload: true
+  retain_payload: false
 
 queue:
   workers: 4
   buffer: 256
-  max_retries: 3
+  max_retries: 2
+  retry_base: 1s
+  max_retry_delay: 15m
+  max_retry_age: 24h
 
 sources:
   # 示例 1: 内部 relay 转发的 GitHub 事件 -> 飞书群机器人
@@ -217,10 +231,10 @@ sources:
       repo: "$.repository.full_name"
     rules:
       - var: branch
-        regex: "refs/heads/(main|master)"
+        regex: "^refs/heads/(main|master)$"
     actions:
       - type: http
-        url: ${FEISHU_BOT}
+        url: ${secret:FEISHU_BOT}
         method: POST
         headers:
           Content-Type: application/json
@@ -243,13 +257,13 @@ sources:
     rules: []
     actions:
       - type: http
-        url: "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
+        url: "https://api.telegram.org/bot${secret:TG_BOT_TOKEN}/sendMessage"
         method: POST
         headers:
           Content-Type: application/json
         body: |
           {
-            "chat_id": "${TG_CHAT_ID}",
+            "chat_id": "${secret:TG_CHAT_ID}",
             "text": "🛎 宝塔告警 [${type}]\n${title}\n${msg}"
           }
 
@@ -275,13 +289,20 @@ sources:
 | --- | --- | --- |
 | `server.addr` | `:8080` | 容器内 HTTP 监听地址；不表示宿主机端口已发布 |
 | `server.trusted_proxies` | `[]` | 可代表客户端传递转发头的可信代理 IP/CIDR；标准部署无入站反代，应保持为空 |
+| `server.max_in_flight` | `16` | 鉴权前全局并发请求上限 |
+| `server.max_in_flight_bytes` | `32MiB` | 鉴权前在途请求体字节预算 |
+| `admin.header` | `Authorization` | 运维接口鉴权头 |
+| `admin.token` | 未配置 | 运维 Bearer token；为空时运维路由不会注册 |
 | `log.level` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
 | `store.path` | `data/webhook.db` | SQLite 文件路径 |
-| `store.retention` | `720h` | 终态事件与动作日志的保留时间；`pending`/`processing` 不会被清理 |
-| `store.retain_payload` | `true` | 是否在处理完成后继续保留原始 payload；设为 `false` 可缩小敏感数据留存 |
-| `queue.workers` | `4` | 异步处理 worker 数量 |
+| `store.retention` | `720h` | 终态事件与动作日志的保留时间（按 `processed_at`，缺省回退 `received_at`）；`pending`/`processing`/`retrying` 不会被清理 |
+| `store.retain_payload` | `false` | `false` 时，命中规则的事件在 `vars_json`/action 状态同事务提交后清除 payload；skipped 在终态提交后清除；预处理失败的 dead 事件保留 payload 供排障/replay |
+| `queue.workers` | `4` | 异步处理 worker 数量（1–64） |
 | `queue.buffer` | `256` | 内存唤醒信号容量，不是持久任务容量 |
-| `queue.max_retries` | `3` | 每个动作的最大尝试次数 |
+| `queue.max_retries` | `2` | 首次执行后的额外重试次数（0–20）；0 表示只尝试一次 |
+| `queue.retry_base` | `1s` | 指数退避基础时间 |
+| `queue.max_retry_delay` | `15m` | 抖动退避上限；服务端 `Retry-After` 不会被静默截短 |
+| `queue.max_retry_age` | `24h` | 一个事件允许自动重试的最长期限，超过后进入 `dead` |
 
 ### Source 配置
 
@@ -293,13 +314,14 @@ sources:
 | `rules` | 正则过滤规则，所有规则都命中才执行动作；空数组表示总是触发 |
 | `actions` | 动作列表，按顺序执行 |
 
-`hmac` 和 `token` 类型必须配置非空 `secret`。
+`hmac` 和 `token` 类型必须配置至少 16 字节的 `secret`。内部 relay 若设置 `signed_headers`，必须精确使用 `[timestamp, delivery_id, body]`；空数组保留 GitHub 兼容的仅 body 签名。
 示例配置默认包含 `github`、`custom`、`bt`、`dingtalk-demo` 四个 source；使用默认配置启动时，请提供其中 token/HMAC source 需要的 secret 环境变量，或删除暂不启用的 source。
 
 **环境变量处理**：
 
-- **配置层字段**（`auth.secret`、`action.url`、`action.command`）支持 `${VAR}` 环境变量注入，在配置加载时展开
-- **运行时插值字段**（`action.body`、`action.headers`、`action.args`）中的 `${var}` 先从 `extract` 抽取的变量中替换，未命中时再读取同名环境变量
+- `auth.secret` / `admin.token` 的 `${VAR}` 在配置加载时展开，但不会进入动作快照。
+- `${event:name}` 只读取事件变量；`${secret:NAME}` 在启动校验时必须存在、在 action 执行时读取环境变量，快照保存引用而非凭据。
+- 旧式 `${name}` 为兼容语法：先读取事件变量，未命中时读取同名环境变量；新增配置应优先使用显式命名空间。
 
 示例：
 
@@ -313,7 +335,7 @@ sources:
       repo: $.repository.name   # 从 payload 抽取
     actions:
       - type: http
-        url: ${FEISHU_BOT}      # 配置加载时从环境变量注入
+        url: ${secret:FEISHU_BOT} # 执行时读取环境变量；快照只保存引用
         body: |                 # body 中的 ${repo} 是运行时变量，从 extract 获取
           {"text": "${repo} updated"}
 ```
@@ -334,19 +356,19 @@ sources:
 
 #### http
 
-通用 HTTP 请求，支持完全自定义 URL/Method/Headers/Body，所有字段支持 `${var}` 插值。
+通用 HTTP 请求，支持完全自定义 URL/Method/Headers/Body。事件值使用 `${event:name}`（兼容 `${name}`），凭据使用 `${secret:NAME}`。
 
 **Telegram bot 示例**：
 
 ```yaml
 - type: http
-  url: "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
+  url: "https://api.telegram.org/bot${secret:TG_BOT_TOKEN}/sendMessage"
   method: POST
   headers:
     Content-Type: application/json
   body: |
     {
-      "chat_id": "${TG_CHAT_ID}",
+      "chat_id": "${secret:TG_CHAT_ID}",
       "text": "告警: ${title}\n${msg}"
     }
 ```
@@ -355,7 +377,7 @@ sources:
 
 ```yaml
 - type: http
-  url: ${FEISHU_BOT}
+  url: ${secret:FEISHU_BOT}
   method: POST
   headers:
     Content-Type: application/json
@@ -370,7 +392,7 @@ sources:
 
 ```yaml
 - type: http
-  url: "https://oapi.dingtalk.com/robot/send?access_token=${DINGTALK_TOKEN}"
+  url: "https://oapi.dingtalk.com/robot/send?access_token=${secret:DINGTALK_TOKEN}"
   method: POST
   body: |
     {
@@ -385,6 +407,8 @@ sources:
 - type: http
   url: "https://n8n.local/webhook/deploy"
   method: POST
+  allow_private: true
+  url_allowlist: ["n8n.local"]
   headers:
     X-Webhook-Source: general-webhook
   body: |
@@ -403,10 +427,12 @@ sources:
 | `method` | ❌ | HTTP 方法，默认 `POST` |
 | `headers` | ❌ | 自定义请求头，key/value 都支持插值 |
 | `body` | ❌ | 请求体模板，支持 `${var}` 插值；JSON 字符串值会做转义；为空时不设 body |
+| `url_allowlist` | ❌ | 结构化 host、host:port、CIDR 或 URL 路径白名单；未配置时仅允许公网 `https` |
+| `allow_private` | ❌ | 默认 `false`；私网 DNS/IP 目标必须同时显式启用并命中 allowlist |
 
-默认 `Content-Type: application/json`（`body` 非空且未显式设置时），可通过 `headers` 覆盖。
+默认 `Content-Type: application/json`（`body` 非空且未显式设置时），可通过 `headers` 覆盖。每次 HTTP action 尝试的总超时固定为 15 秒。初始 URL、DNS 解析结果及每次重定向都会校验；跨主机重定向、loopback、link-local、metadata 与 DNS rebinding 会被拒绝。出站请求不继承 `HTTP_PROXY`，如需代理应把经过评审的网关配置为明确目标。
 
-**出站目标代理**：若容器访问 Telegram 等目标必须经过代理或兼容网关，可把 action 的 `url` 改为经过评审的出站地址。它只改变 Webhook 发出的请求，不表示可以把本服务通过反向代理暴露到公网；使用第三方代理时还应评估 URL token 和消息内容的泄露风险。
+**出站目标代理**：若容器访问 Telegram 等目标必须经过代理或兼容网关，可把 action 的 `url` 改为经过评审的出站地址，并把它加入 `url_allowlist`。它只改变 Webhook 发出的请求，不表示可以把本服务通过反向代理暴露到公网。
 
 #### exec
 
@@ -419,11 +445,11 @@ sources:
   timeout: 300s
 ```
 
-`exec` 不经过 shell，`command` 与 `args` 会逐个传入 `exec.CommandContext`。默认超时为 `60s`，输出最多保存 8 KB。
+`exec` 不经过 shell，`command` 与 `args` 会逐个传入 `exec.Command`；超时通过独立 context 与进程组终止实现。默认超时为 `60s`，输出最多保存 8 KB。
 
 ### 变量插值
 
-动作配置里的字符串支持 `${var}` 插值，用于：
+动作配置里的字符串支持 `${event:var}`、`${secret:NAME}` 和兼容形式 `${var}`，用于：
 
 - `http.url`
 - `http.headers` 的 key 和 value
@@ -434,16 +460,18 @@ sources:
 
 ## 审计与日志
 
-SQLite 会自动创建两个表：
+SQLite 会自动创建持久状态与审计表：
 
 | 表 | 内容 |
 | --- | --- |
-| `events` | source、remote_ip、状态与时间；payload 在 `retain_payload=false` 时会于处理完成后清除 |
-| `action_logs` | 每次动作尝试的 action、已脱敏 target/detail、attempt、success、duration_ms |
+| `events` | source、状态、`vars_json`、毫秒时间、replay 代次和动作快照；按要求使用 `${secret:NAME}` 时只保存引用 |
+| `event_actions` | 每个 action 的状态、尝试次数、`next_attempt_at`、最近错误与完成时间 |
+| `action_logs` | 每次尝试的 action index、replay 代次、已脱敏 target/detail 和耗时 |
+| `replay_guard` | HMAC body 的原子、带过期时间重放保护键 |
 
-日志输出到 stdout，格式为 JSON。标准 Compose 使用有界的 Docker `json-file` 日志（10 MiB × 5）；若另接 Loki/ELK，应保留等价的容量或保留期边界。日志以及写入 SQLite 的 action target/detail 都会先对常见 URL token 脱敏。数据目录权限为 `0700`、数据库文件为 `0600`；`store.retention` 默认保留终态事件 30 天。
+日志输出到 stdout，格式为 JSON。标准 Compose 使用有界的 Docker `json-file` 日志（10 MiB × 5）；若另接 Loki/ELK，应保留等价的容量或保留期边界。日志以及写入 SQLite 的 action target/detail 都会先脱敏；HTTP target 只保留 `scheme://host[:port]`，不保存可能携带凭据的 path/query。数据目录权限为 `0700`、数据库文件为 `0600`；`store.retention` 默认保留终态事件 30 天。
 
-HMAC 重放边界：签名仅覆盖 body（供应方协议）。运营层去重键为供应方 delivery ID（及可选时间窗），不构成密码学绑定；相同 body 只要 delivery ID 不同即可被接受。HTTP action 的 `Idempotency-Key` 在整个重试过程中固定为 `event_id`，attempt 通过 `X-Webhook-Attempt` 传递；exec 动作须由脚本自身保证幂等。
+HMAC 重放边界：GitHub 兼容模式签名仅覆盖 body，但必须同时提供 delivery ID 与 `X-Webhook-Timestamp`；同 source/body 的 replay guard 与事件写入在同一事务完成。内部 relay 可配置 `auth.signed_headers: [timestamp, delivery_id, body]` 做密码学绑定。动作凭据必须写成 `${secret:NAME}`，此时快照只保存引用；不要在 URL、header、body 或 args 中内联凭据。HTTP action 的 `Idempotency-Key` 固定为 `event_id:action_index`；`4xx`（除 408/429）不重试，并持久化 `Retry-After`。
 
 典型日志字段：
 
@@ -452,41 +480,65 @@ HMAC 重放边界：签名仅覆盖 body（供应方协议）。运营层去重�
 | `trace_id` | 等于 `event_id`，用于串联一次请求的全链路日志 |
 | `source` | webhook 来源 |
 | `type` | 动作类型 |
-| `target` | 动作目标，如 channel、URL 或 command |
+| `target` | 动作目标；HTTP 仅记录 origin，exec 记录 command |
 | `attempt` | 第几次尝试 |
 | `duration_ms` | 动作耗时 |
 
-## 历史兼容部署
-
-`deploy/general-webhook.service` 与 `deploy/general-webhook.env.example` 仅保留给已有 systemd 安装做迁移参考，不属于受支持的标准生产部署，也不保证与 Docker 的镜像内容、资源和网络边界等价。新部署及迁移目标都应使用 Dockerfile 与 `docker-compose.yaml`；不要同时运行 Docker 和 systemd 实例并共享同一个 SQLite 数据目录。
-
 ## 安全边界
 
+- 唯一推荐部署：Dockerfile 构建 + Docker Compose；见 [INSTALL.md](INSTALL.md) 与 [deploy/README.md](deploy/README.md)。
 - `auth.type` 必须显式配置，避免漏配时意外放行。
-- `hmac` / `token` 的 `secret` 不能为空，配置加载时会校验。
+- `hmac` / `token` 的 `secret` 至少 16 字节，配置加载时会校验。
 - 标准 Compose 不发布宿主机端口；入口仅存在于受控的 `webhook-internal` 网络。
 - 容器使用固定非 root 用户、只读根文件系统、`cap_drop: ALL` 和 `no-new-privileges`。
 - CPU、内存与 swap、PID、`nofile`、临时目录和 Docker JSON 日志都有默认边界。
 - `.env` 必须为 `0600`，数据目录必须为 `0700` 且归容器 UID/GID 所有。
-- 请求体最大 5 MB，超过直接拒绝。
+- 请求体最大 1 MiB；进程级并发与在途字节预算限制鉴权前内存峰值。
 - SQLite outbox 是任务事实来源；内存通道只发送唤醒信号，进程重启后仍会继续认领未完成任务。
+- 关停取消的 in-flight 事件回退为 `pending`，不会写成终态 `partial`。
 - `exec` 不经过 shell，减少命令注入风险。
 - 外部命令有超时限制，输出会截断后再进入审计记录。
+- HTTP 动作未配置 `url_allowlist` 时仅允许公网 HTTPS；配置后目标必须命中，私网目标还必须显式设置 `allow_private: true`。
+- 运维接口只有配置 `admin.token` 后才注册；默认 `Authorization` header 要求 Bearer token，并有独立限流。
+- 使用 `${secret:NAME}` 的动作凭据在快照中只保存引用；启动时会清理旧快照中仍可识别的当前凭据值。
 - 日志以及写入审计库的 action target/detail 会在持久化前脱敏。
 - SQLite 使用单写连接，避免并发写导致 `database is locked`。
 
+## 运维接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/events/{id}` | 事件状态与近期 action_logs |
+| `GET` | `/queue/stats` | 队列状态计数与最老未完成事件年龄 |
+| `POST` | `/events/{id}/retry` | 只重置 `dead` action；成功 action 不会重放 |
+| `GET` | `/metrics` | Prometheus 文本指标 |
+
+这些接口与 webhook 共用监听地址，同时受 Docker 网络和管理 token 两层保护。默认 `admin.header: Authorization` 时必须携带 `Authorization: Bearer $ADMIN_TOKEN`；若改为自定义 header，则直接传原始 token，不加 `Bearer`。未配置 token 时路由返回 404。replay 可选提交不超过 256 字节的审计原因：
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" http://general-webhook:8080/queue/stats
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"reason":"downstream recovered"}' http://general-webhook:8080/events/EVENT_ID/retry
+```
+
+旧版本 `partial` / `error` 事件没有 `event_actions` 明细时，人工 replay 会初始化并重放该事件的全部 action；操作前必须确认下游幂等性。新版本 `dead` 事件只重置失败 action，已经 `done` 的 action 保持不变；`max_retry_age` 从本次 replay 时间重新计算。
+
+`/metrics` 暴露事件/动作队列深度、最老未完成事件年龄，以及 5 分钟和 1 小时滚动 action 尝试数与失败率。至少应对以下条件告警：
+
+- `general_webhook_events{status=~"dead|partial|error"} > 0`
+- `general_webhook_oldest_pending_age_milliseconds` 超过业务允许的未完成时限
+- `general_webhook_action_failure_ratio{window="5m"}` 持续升高（同时用 `general_webhook_action_attempts` 设置最小样本量）
+
 ## 当前限制
 
-- SQLite outbox 是单节点持久队列，不是分布式队列；`pending` 会在重启后继续处理，租约过期的 `processing` 会被重新认领。
-- 当前没有 HTTP replay 端点；`retain_payload=false` 时，终态事件也没有 payload 可供重放。
-- `webhook-egress` 提供必要的出站连接，但 Docker bridge 本身不是目标域名白名单；需要严格限制目的地时，应在宿主机防火墙或专用出站代理实施策略。
+- SQLite outbox 是单节点持久队列，不是分布式队列；单实例重启会重置本进程遗留的 `processing` 租约。
+- `retain_payload=false`（默认）时，命中规则的事件在 `vars_json` 和 action 状态提交成功后清除 payload，skipped 事件在提交终态后清除；预处理失败的 dead 事件通常保留 payload。已持久化变量的 dead replay 不依赖 payload；旧版本已清空且没有 `vars_json` 的事件会明确返回 `409`。
 - 规则正则在每次事件处理时编译，当前更偏向配置简单和实现直接。
 - `exec.command` 由镜像内配置控制，目前没有额外的允许目录白名单。
 - `restart: unless-stopped` 只在进程退出时重启；单纯 `unhealthy` 不会触发 Docker 自动重启，应由监控系统告警。
 
 ## 后续方向
 
-- 增加 `POST /replay/{event_id}` 事件重放端点。
 - 对规则正则做启动期预编译。
 - 增加 `exec` 命令白名单或允许目录校验。
 - 审计库增加定时备份，例如 SQLite 快照到 S3 兼容存储。
