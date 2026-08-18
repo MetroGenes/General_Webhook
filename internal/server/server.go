@@ -18,6 +18,7 @@ import (
 
 	"github.com/MetroGenes/General_Webhook/internal/auth"
 	"github.com/MetroGenes/General_Webhook/internal/config"
+	"github.com/MetroGenes/General_Webhook/internal/heartbeat"
 	"github.com/MetroGenes/General_Webhook/internal/logger"
 	"github.com/MetroGenes/General_Webhook/internal/queue"
 	"github.com/MetroGenes/General_Webhook/internal/store"
@@ -46,6 +47,7 @@ type Server struct {
 	trusted  *trustedNets
 	now      func() time.Time
 	stopping atomic.Bool
+	hb       *heartbeat.Monitor
 }
 
 func New(cfg *config.Config, q *queue.Queue, st *store.Store) *Server {
@@ -78,6 +80,16 @@ func New(cfg *config.Config, q *queue.Queue, st *store.Store) *Server {
 }
 
 func (s *Server) SetStopping() { s.stopping.Store(true) }
+
+// Stopping reports whether the HTTP server has begun graceful shutdown.
+// The heartbeat monitor uses it to keep reporting "pass" while the process is
+// draining normally (it is stopped before the drain starts, so this is a
+// belt-and-braces check rather than the primary signal).
+func (s *Server) Stopping() bool { return s.stopping.Load() }
+
+// SetHeartbeat registers the deadman monitor so /metrics can expose the last
+// successful push. Nil-safe: the metric line is omitted when not configured.
+func (s *Server) SetHeartbeat(m *heartbeat.Monitor) { s.hb = m }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -362,6 +374,23 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "# HELP general_webhook_oldest_pending_age_milliseconds Age of the oldest unfinished event.\n")
 	_, _ = io.WriteString(w, "# TYPE general_webhook_oldest_pending_age_milliseconds gauge\n")
 	_, _ = fmt.Fprintf(w, "general_webhook_oldest_pending_age_milliseconds %d\n", stats.OldestPendingAgeMS)
+	if s.q != nil {
+		_, _ = io.WriteString(w, "# HELP general_webhook_policy_drops_total Allowlist rejections by source and value.\n")
+		_, _ = io.WriteString(w, "# TYPE general_webhook_policy_drops_total counter\n")
+		for src, byVal := range s.q.DropSnapshot() {
+			for value, n := range byVal {
+				_, _ = fmt.Fprintf(w, "general_webhook_policy_drops_total{source=%q,value=%q} %d\n", src, value, n)
+			}
+		}
+		_, _ = io.WriteString(w, "# HELP general_webhook_policy_drops_summary Human-readable drop summary for heartbeats.\n")
+		_, _ = io.WriteString(w, "# TYPE general_webhook_policy_drops_summary gauge\n")
+		_, _ = fmt.Fprintf(w, "# %s\n", s.q.DropSummary())
+	}
+	if s.hb != nil {
+		_, _ = io.WriteString(w, "# HELP general_webhook_heartbeat_last_success_timestamp Unix seconds of the last deadman heartbeat push accepted by any target (0 = never).\n")
+		_, _ = io.WriteString(w, "# TYPE general_webhook_heartbeat_last_success_timestamp gauge\n")
+		_, _ = fmt.Fprintf(w, "general_webhook_heartbeat_last_success_timestamp %d\n", s.hb.LastSuccess())
+	}
 }
 
 func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {

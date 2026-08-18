@@ -27,6 +27,8 @@ chmod 600 .env
 
 `.env.example` 中的 source secret、action token 与 `ADMIN_TOKEN` 默认留空。编辑 `.env`，为管理接口设置至少 16 字节的独立随机 token，并只填写实际启用 source 所需的值；未使用的 source 应从 `configs/webhooks.yaml` 删除并重新构建镜像。不要复用 source token，也不要把 `.env` 加入镜像或版本库。
 
+Deadman 心跳（可选）：`HEARTBEAT_URL` / `CF_HEARTBEAT_URL` 等全部留空时心跳模块不启动，无需改动镜像；启用时参考 README「心跳模块」一节。多机部署时为每台主机设置唯一的 `HOST_LABEL`（未设置则回退 `general-webhook`）。
+
 正式发布必须使用唯一版本或提交哈希，不使用可漂移的 `latest`：
 
 ~~~dotenv

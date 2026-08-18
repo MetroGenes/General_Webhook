@@ -19,6 +19,7 @@ import (
 
 	"github.com/MetroGenes/General_Webhook/internal/config"
 	"github.com/MetroGenes/General_Webhook/internal/handler"
+	"github.com/MetroGenes/General_Webhook/internal/heartbeat"
 	"github.com/MetroGenes/General_Webhook/internal/queue"
 	"github.com/MetroGenes/General_Webhook/internal/store"
 )
@@ -318,6 +319,22 @@ func TestOpsEndpoints(t *testing.T) {
 	}
 	if !strings.Contains(recMetrics.Body.String(), "general_webhook_action_failure_ratio") {
 		t.Fatalf("metrics missing action failure ratio: %q", recMetrics.Body.String())
+	}
+}
+
+func TestMetrics_HeartbeatGauge(t *testing.T) {
+	srv := newTestServer(t, config.AuthConfig{Type: "none"}, 8)
+	// Attach a monitor with no targets; the metric must report 0 (never).
+	hb := heartbeat.New(config.HeartbeatConfig{Host: "test"}, srv.st, nil, nil)
+	srv.SetHeartbeat(hb)
+
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, adminRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("metrics = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "general_webhook_heartbeat_last_success_timestamp 0") {
+		t.Fatalf("metrics missing heartbeat gauge: %q", rec.Body.String())
 	}
 }
 

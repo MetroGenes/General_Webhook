@@ -27,6 +27,27 @@ queue:
   max_retry_delay: 15m
   max_retry_age: 24h
 
+# Deadman 心跳 (可选, 默认关闭): 进程周期性向外部监控端点 POST 存活信号。
+# 标准部署不发布宿主端口, 外部探针无法入站访问 /readyz, 因此由进程自己
+# 主动外推心跳 (Healthchecks.io / Uptime Kuma push / Cloudflare Pages 接收器)。
+# URL/token 经环境变量提供; 全部 URL 为空时整个模块不启动 (fail closed)。
+#   - mode: push (默认): 正常 POST url, 不健康时 POST url+/fail (Healthchecks 风格)
+#   - mode: json: 始终 POST url, 负载带 status/exit_code/stats (Cloudflare 风格)
+# 只有显式设置 allow_http: true 才接受 http:// (内部 Uptime Kuma 等)。
+heartbeat:
+  interval: 60s
+  timeout: 10s
+  host: ${HOST_LABEL}
+  targets:
+    - name: healthchecks
+      url: ${HEARTBEAT_URL}
+      token: ${HEARTBEAT_TOKEN}
+      mode: push
+    - name: cf-pages
+      url: ${CF_HEARTBEAT_URL}
+      token: ${CF_HEARTBEAT_TOKEN}
+      mode: json
+
 sources:
   # 示例 1: 内部 relay 转发的 GitHub push, HMAC 校验, 通知飞书 + 转发自定义服务
   # 默认 Docker 部署不接受公网 GitHub 直连，也不要为此添加宿主端口。

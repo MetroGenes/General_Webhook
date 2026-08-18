@@ -15,6 +15,7 @@ import (
 	"github.com/MetroGenes/General_Webhook/internal/handler"
 	"github.com/MetroGenes/General_Webhook/internal/logger"
 	"github.com/MetroGenes/General_Webhook/internal/parser"
+	"github.com/MetroGenes/General_Webhook/internal/policy"
 	"github.com/MetroGenes/General_Webhook/internal/router"
 	"github.com/MetroGenes/General_Webhook/internal/store"
 )
@@ -52,6 +53,7 @@ type Queue struct {
 	liveWorkers   atomic.Int32
 	now           func() time.Time
 	jitter        func(time.Duration) time.Duration
+	drops         *policy.Counters
 }
 
 func New(cfg config.QueueConfig, reg *handler.Registry, st *store.Store, sources *config.Config, owner string) *Queue {
@@ -96,6 +98,7 @@ func New(cfg config.QueueConfig, reg *handler.Registry, st *store.Store, sources
 		cfg:           sources,
 		stopCh:        make(chan struct{}),
 		now:           time.Now,
+		drops:         policy.NewCounters(),
 	}
 	q.jitter = func(cap time.Duration) time.Duration {
 		if cap <= 0 {
@@ -431,6 +434,23 @@ func (q *Queue) executionVars(ctx context.Context, ev *store.PendingEvent, src *
 	vars := parser.Extract(payload, src.Extract)
 	vars["event_id"] = ev.ID
 	vars["delivery_id"] = ev.ExternalDeliveryID
+
+	if rejectedValue, ok := policy.Allow(src, vars); !ok {
+		q.drops.Inc(src.Name, rejectedValue)
+		log.Info("log_policy rejected", "source", src.Name, "value", rejectedValue)
+		if err := q.st.UpdateEventStatus(context.WithoutCancel(ctx), ev.ID, "skipped", q.now()); err != nil {
+			log.Error("mark skipped", "err", err)
+			q.requeue(ctx, ev.ID)
+			return nil, false
+		}
+		if q.cfg != nil && q.cfg.Store.RetainPayload != nil && !*q.cfg.Store.RetainPayload {
+			if err := q.st.ClearPayload(context.WithoutCancel(ctx), ev.ID); err != nil {
+				log.Error("clear skipped payload", "err", err)
+			}
+		}
+		return nil, false
+	}
+
 	matched, err := router.Match(src.Rules, vars)
 	if err != nil {
 		log.Error("rule match error", "err", err)
@@ -450,7 +470,24 @@ func (q *Queue) executionVars(ctx context.Context, ev *store.PendingEvent, src *
 		}
 		return nil, false
 	}
+	policy.Redact(src, vars)
 	return vars, true
+}
+
+// DropSummary returns a heartbeat-friendly drop counter line.
+func (q *Queue) DropSummary() string {
+	if q == nil || q.drops == nil {
+		return "dropped: none"
+	}
+	return q.drops.Summary()
+}
+
+// DropSnapshot returns per-source allowlist rejection counts.
+func (q *Queue) DropSnapshot() map[string]map[string]uint64 {
+	if q == nil || q.drops == nil {
+		return map[string]map[string]uint64{}
+	}
+	return q.drops.Snapshot()
 }
 
 func (q *Queue) retryDelay(attempt int) time.Duration {

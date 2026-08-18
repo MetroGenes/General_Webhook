@@ -16,6 +16,7 @@ import (
 
 	"github.com/MetroGenes/General_Webhook/internal/config"
 	"github.com/MetroGenes/General_Webhook/internal/handler"
+	"github.com/MetroGenes/General_Webhook/internal/heartbeat"
 	"github.com/MetroGenes/General_Webhook/internal/logger"
 	"github.com/MetroGenes/General_Webhook/internal/queue"
 	"github.com/MetroGenes/General_Webhook/internal/server"
@@ -105,6 +106,22 @@ func run() error {
 		IdleTimeout:       90 * time.Second,
 	}
 
+	// Deadman heartbeat: pushes liveness outward when at least one target is
+	// configured. Stopped at the start of shutdown so a graceful restart is
+	// absorbed by the monitor grace period instead of firing a false alert.
+	var stopHeartbeat context.CancelFunc = func() {}
+	if len(cfg.Heartbeat.Targets) > 0 {
+		hbCtx, hbCancel := context.WithCancel(context.Background())
+		stopHeartbeat = hbCancel
+		hb := heartbeat.New(cfg.Heartbeat, st,
+			func() bool { return !api.Stopping() && q.Ready() },
+			q.DropSummary)
+		api.SetHeartbeat(hb)
+		hb.Start(hbCtx)
+		log.Info("heartbeat enabled", "targets", len(cfg.Heartbeat.Targets),
+			"interval", cfg.Heartbeat.Interval.Duration.String(), "host", cfg.Heartbeat.Host)
+	}
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("server starting", "addr", cfg.Server.Addr, "sources", len(cfg.Sources), "owner", ownerID)
@@ -123,6 +140,7 @@ func run() error {
 		if err != nil {
 			log.Error("server error", "err", err)
 			api.SetStopping()
+			stopHeartbeat()
 			cancelWorker()
 			_ = q.Stop(context.Background())
 			return fmt.Errorf("server error: %w", err)
@@ -130,6 +148,7 @@ func run() error {
 	}
 
 	api.SetStopping()
+	stopHeartbeat()
 	deadline := time.Now().Add(totalShutdownBudget)
 	shutCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()

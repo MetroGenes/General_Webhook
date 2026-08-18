@@ -50,6 +50,13 @@ services:
       TG_CHAT_ID: ${TG_CHAT_ID:-}
       DINGTALK_TOKEN: ${DINGTALK_TOKEN:-}
       DINGTALK_WEBHOOK_TOKEN: ${DINGTALK_WEBHOOK_TOKEN:-}
+      # Deadman heartbeat (optional; module stays off when no URL is set)
+      HEARTBEAT_URL: ${HEARTBEAT_URL:-}
+      HEARTBEAT_TOKEN: ${HEARTBEAT_TOKEN:-}
+      CF_HEARTBEAT_URL: ${CF_HEARTBEAT_URL:-}
+      CF_HEARTBEAT_TOKEN: ${CF_HEARTBEAT_TOKEN:-}
+      HOST_LABEL: ${HOST_LABEL:-}
+      GENERAL_WEBHOOK_GIT_COMMIT: ${GENERAL_WEBHOOK_GIT_COMMIT:-}
     networks:
       webhook-internal:
         aliases:

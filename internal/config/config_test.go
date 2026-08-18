@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoad_EnvExpansion(t *testing.T) {
@@ -204,5 +205,144 @@ sources:
 	}
 	if cfg.Sources[0].Actions[0].URL != "https://${tenant}.example/hook" {
 		t.Fatalf("url = %q", cfg.Sources[0].Actions[0].URL)
+	}
+}
+
+func loadHeartbeatYAML(t *testing.T, content string) (*Config, error) {
+	t.Helper()
+	tmp := filepath.Join(t.TempDir(), "hb.yaml")
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return Load(tmp)
+}
+
+func TestLoad_HeartbeatDefaultsAndEnvExpansion(t *testing.T) {
+	os.Setenv("HB_TEST_URL", "https://hc-ping.com/uuid123/check")
+	os.Setenv("HB_TEST_TOKEN", "hb-token-123456")
+	os.Setenv("HB_TEST_HOST", "node-tokyo")
+	defer os.Unsetenv("HB_TEST_URL")
+	defer os.Unsetenv("HB_TEST_TOKEN")
+	defer os.Unsetenv("HB_TEST_HOST")
+
+	cfg, err := loadHeartbeatYAML(t, `
+heartbeat:
+  host: ${HB_TEST_HOST}
+  targets:
+    - name: healthchecks
+      url: ${HB_TEST_URL}
+      token: ${HB_TEST_TOKEN}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Heartbeat.Interval.Duration != 60*time.Second {
+		t.Errorf("interval = %s, want 60s", cfg.Heartbeat.Interval)
+	}
+	if cfg.Heartbeat.Timeout.Duration != 10*time.Second {
+		t.Errorf("timeout = %s, want 10s", cfg.Heartbeat.Timeout)
+	}
+	if cfg.Heartbeat.Host != "node-tokyo" {
+		t.Errorf("host = %q", cfg.Heartbeat.Host)
+	}
+	if len(cfg.Heartbeat.Targets) != 1 {
+		t.Fatalf("targets = %d, want 1", len(cfg.Heartbeat.Targets))
+	}
+	if cfg.Heartbeat.Targets[0].URL != "https://hc-ping.com/uuid123/check" {
+		t.Errorf("url = %q", cfg.Heartbeat.Targets[0].URL)
+	}
+	if cfg.Heartbeat.Targets[0].Token != "hb-token-123456" {
+		t.Errorf("token = %q", cfg.Heartbeat.Targets[0].Token)
+	}
+	if cfg.Heartbeat.Targets[0].Mode != "push" {
+		t.Errorf("mode = %q, want default push", cfg.Heartbeat.Targets[0].Mode)
+	}
+}
+
+func TestLoad_HeartbeatDisabledWhenURLEnvUnset(t *testing.T) {
+	// No env set: the only target is dropped and the module stays off.
+	cfg, err := loadHeartbeatYAML(t, `
+heartbeat:
+  targets:
+    - name: healthchecks
+      url: ${HB_UNSET_URL}
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Heartbeat.Targets) != 0 {
+		t.Errorf("targets = %d, want 0 (fail closed)", len(cfg.Heartbeat.Targets))
+	}
+}
+
+func TestLoad_HeartbeatRejectsBadConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name:    "interval too small",
+			yaml:    "heartbeat:\n  interval: 1s\n",
+			wantErr: "heartbeat.interval",
+		},
+		{
+			name:    "timeout exceeds interval",
+			yaml:    "heartbeat:\n  interval: 10s\n  timeout: 20s\n",
+			wantErr: "heartbeat.timeout must not exceed",
+		},
+		{
+			name:    "http without allow_http",
+			yaml:    "heartbeat:\n  targets:\n    - name: kuma\n      url: http://192.168.1.5:3001/api/push/abc\n",
+			wantErr: "must be https",
+		},
+		{
+			name:    "userinfo in url",
+			yaml:    "heartbeat:\n  targets:\n    - name: kuma\n      url: https://user:pass@example.com/push\n",
+			wantErr: "userinfo",
+		},
+		{
+			name:    "bad mode",
+			yaml:    "heartbeat:\n  targets:\n    - name: kuma\n      url: https://example.com/push\n      mode: smoke\n",
+			wantErr: "unknown mode",
+		},
+		{
+			name:    "duplicate name",
+			yaml:    "heartbeat:\n  targets:\n    - name: a\n      url: https://example.com/1\n    - name: a\n      url: https://example.com/2\n",
+			wantErr: "duplicate target name",
+		},
+		{
+			name:    "invalid name",
+			yaml:    "heartbeat:\n  targets:\n    - name: bad name\n      url: https://example.com/push\n",
+			wantErr: "invalid",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadHeartbeatYAML(t, tc.yaml)
+			if err == nil {
+				t.Fatalf("want error containing %q, got nil", tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q, want containing %q", err.Error(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_HeartbeatAllowsHTTPWithAllowHTTP(t *testing.T) {
+	cfg, err := loadHeartbeatYAML(t, `
+heartbeat:
+  targets:
+    - name: kuma
+      url: http://192.168.1.5:3001/api/push/abc
+      allow_http: true
+      mode: json
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Heartbeat.Targets) != 1 || cfg.Heartbeat.Targets[0].Mode != "json" {
+		t.Fatalf("targets = %+v", cfg.Heartbeat.Targets)
 	}
 }

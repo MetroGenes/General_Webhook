@@ -15,10 +15,12 @@ var explicitSecretRefRe = regexp.MustCompile(`\$\{secret:([A-Za-z_][A-Za-z0-9_]*
 
 // SourceSnapshot is the durable execution plan captured at accept time.
 type SourceSnapshot struct {
-	Name    string            `json:"name"`
-	Extract map[string]string `json:"extract,omitempty"`
-	Rules   []Rule            `json:"rules,omitempty"`
-	Actions []ActionConfig    `json:"actions"`
+	Name      string            `json:"name"`
+	Extract   map[string]string `json:"extract,omitempty"`
+	Rules     []Rule            `json:"rules,omitempty"`
+	Actions   []ActionConfig    `json:"actions"`
+	LogPolicy *LogPolicyConfig  `json:"log_policy,omitempty"`
+	Redaction *RedactionConfig  `json:"redaction,omitempty"`
 }
 
 // SnapshotSource serializes extract/rules/actions for durable outbox execution.
@@ -27,10 +29,12 @@ func SnapshotSource(src *Source) (actionsJSON string, err error) {
 		return "", fmt.Errorf("nil source")
 	}
 	snap := SourceSnapshot{
-		Name:    src.Name,
-		Extract: src.Extract,
-		Rules:   src.Rules,
-		Actions: src.Actions,
+		Name:      src.Name,
+		Extract:   src.Extract,
+		Rules:     src.Rules,
+		Actions:   src.Actions,
+		LogPolicy: src.LogPolicy,
+		Redaction: src.Redaction,
 	}
 	b, err := json.Marshal(snap)
 	if err != nil {
@@ -48,12 +52,28 @@ func ParseSourceSnapshot(raw string) (*Source, error) {
 	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
 		return nil, err
 	}
-	return &Source{
-		Name:    snap.Name,
-		Extract: snap.Extract,
-		Rules:   snap.Rules,
-		Actions: snap.Actions,
-	}, nil
+	src := &Source{
+		Name:      snap.Name,
+		Extract:   snap.Extract,
+		Rules:     snap.Rules,
+		Actions:   snap.Actions,
+		LogPolicy: snap.LogPolicy,
+		Redaction: snap.Redaction,
+	}
+	if src.Redaction != nil {
+		if err := compileRedaction(src.Redaction); err != nil {
+			return nil, fmt.Errorf("snapshot redaction: %w", err)
+		}
+	}
+	if src.LogPolicy != nil {
+		if src.LogPolicy.Field == "" {
+			src.LogPolicy.Field = "service"
+		}
+		if src.LogPolicy.OnReject == "" {
+			src.LogPolicy.OnReject = "drop_and_count"
+		}
+	}
+	return src, nil
 }
 
 // ConfigHash returns a stable hash of all sources' execution plans (excludes secrets).
@@ -62,18 +82,22 @@ func ConfigHash(c *Config) string {
 		return ""
 	}
 	type plan struct {
-		Name    string            `json:"name"`
-		Extract map[string]string `json:"extract,omitempty"`
-		Rules   []Rule            `json:"rules,omitempty"`
-		Actions []ActionConfig    `json:"actions"`
+		Name      string            `json:"name"`
+		Extract   map[string]string `json:"extract,omitempty"`
+		Rules     []Rule            `json:"rules,omitempty"`
+		Actions   []ActionConfig    `json:"actions"`
+		LogPolicy *LogPolicyConfig  `json:"log_policy,omitempty"`
+		Redaction *RedactionConfig  `json:"redaction,omitempty"`
 	}
 	plans := make([]plan, 0, len(c.Sources))
 	for _, s := range c.Sources {
 		plans = append(plans, plan{
-			Name:    s.Name,
-			Extract: s.Extract,
-			Rules:   s.Rules,
-			Actions: s.Actions,
+			Name:      s.Name,
+			Extract:   s.Extract,
+			Rules:     s.Rules,
+			Actions:   s.Actions,
+			LogPolicy: s.LogPolicy,
+			Redaction: s.Redaction,
 		})
 	}
 	b, err := json.Marshal(plans)

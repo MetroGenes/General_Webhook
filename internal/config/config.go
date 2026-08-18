@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"strings"
@@ -14,12 +15,36 @@ import (
 
 // Config 是 webhook 网关的完整配置。
 type Config struct {
-	Server  ServerConfig `yaml:"server"`
-	Admin   AdminConfig  `yaml:"admin"`
-	Log     LogConfig    `yaml:"log"`
-	Store   StoreConfig  `yaml:"store"`
-	Queue   QueueConfig  `yaml:"queue"`
-	Sources []Source     `yaml:"sources"`
+	Server    ServerConfig    `yaml:"server"`
+	Admin     AdminConfig     `yaml:"admin"`
+	Log       LogConfig       `yaml:"log"`
+	Store     StoreConfig     `yaml:"store"`
+	Queue     QueueConfig     `yaml:"queue"`
+	Heartbeat HeartbeatConfig `yaml:"heartbeat"`
+	Sources   []Source        `yaml:"sources"`
+}
+
+// HeartbeatConfig 配置进程外死链（deadman）心跳推送。
+// 标准部署不发布宿主端口、也没有公网反向代理，外部探针无法入站访问
+// /healthz 或 /readyz；心跳改为由进程自己按周期向外部监控端点主动
+// POST（Healthchecks.io、Uptime Kuma push、Cloudflare Pages 等）。
+// 不配置任何有效 target（URL 展开后为空）时整个模块不启动，fail closed。
+type HeartbeatConfig struct {
+	Interval Duration          `yaml:"interval"` // 心跳周期, 默认 60s, 最小 10s
+	Timeout  Duration          `yaml:"timeout"`  // 每个 target 的 HTTP 超时, 默认 10s
+	Host     string            `yaml:"host"`     // JSON 负载里的主机标识, 默认 general-webhook
+	Targets  []HeartbeatTarget `yaml:"targets"`
+}
+
+// HeartbeatTarget 是一个外部监控端点。
+// URL 通常携带监控端的一次性 push token（如 Healthchecks 的 /uuid/slug），
+// 必须经环境变量 ${VAR} 提供，不要明文写进配置文件。
+type HeartbeatTarget struct {
+	Name      string `yaml:"name"`       // 日志标识, 必须是 [a-zA-Z0-9_-]{1,64}
+	URL       string `yaml:"url"`        // 死链 push URL, 默认要求 https
+	Token     string `yaml:"token"`      // 可选; 非空时作为 X-Heartbeat-Token 头发送
+	Mode      string `yaml:"mode"`       // push(默认) | json
+	AllowHTTP bool   `yaml:"allow_http"` // 显式允许 http:// URL (内部 Uptime Kuma 等)
 }
 
 // AdminConfig protects operational and replay endpoints. When Token is empty,
@@ -57,11 +82,28 @@ type QueueConfig struct {
 
 // Source 是一个事件源, 对应 /webhook/{name}。
 type Source struct {
-	Name    string            `yaml:"name"`
-	Auth    AuthConfig        `yaml:"auth"`
-	Extract map[string]string `yaml:"extract"` // 变量名 -> JSONPath
-	Rules   []Rule            `yaml:"rules"`
-	Actions []ActionConfig    `yaml:"actions"`
+	Name      string            `yaml:"name"`
+	Auth      AuthConfig        `yaml:"auth"`
+	Extract   map[string]string `yaml:"extract"` // 变量名 -> JSONPath
+	Rules     []Rule            `yaml:"rules"`
+	Actions   []ActionConfig    `yaml:"actions"`
+	LogPolicy *LogPolicyConfig  `yaml:"log_policy,omitempty"`
+	Redaction *RedactionConfig  `yaml:"redaction,omitempty"`
+}
+
+// LogPolicyConfig is an optional egress allowlist evaluated after extract.
+// mode is hard-coded to allowlist semantics (denylist is not offered).
+type LogPolicyConfig struct {
+	Mode     string   `yaml:"mode"`                // must be "allowlist"
+	Field    string   `yaml:"field,omitempty"`     // extracted var to check; default "service"
+	Services []string `yaml:"services"`            // allowed values (non-empty when set)
+	OnReject string   `yaml:"on_reject,omitempty"` // must be "drop_and_count" when set
+}
+
+// RedactionConfig applies regex replacements to extracted vars before delivery.
+type RedactionConfig struct {
+	Patterns []string         `yaml:"patterns" json:"patterns"`
+	Compiled []*regexp.Regexp `yaml:"-" json:"-"`
 }
 
 type AuthConfig struct {
@@ -151,6 +193,20 @@ func Load(path string) (*Config, error) {
 		c.Sources[i].Auth.Secret = expandConfigEnv(c.Sources[i].Auth.Secret, true)
 	}
 	c.Admin.Token = expandConfigEnv(c.Admin.Token, true)
+	c.Heartbeat.Host = expandConfigEnv(c.Heartbeat.Host, true)
+	for i := range c.Heartbeat.Targets {
+		c.Heartbeat.Targets[i].URL = expandConfigEnv(c.Heartbeat.Targets[i].URL, true)
+		c.Heartbeat.Targets[i].Token = expandConfigEnv(c.Heartbeat.Targets[i].Token, true)
+	}
+	// Drop targets whose URL env is unset: the whole module stays off until
+	// the operator supplies at least one push endpoint (fail closed).
+	filtered := c.Heartbeat.Targets[:0]
+	for _, t := range c.Heartbeat.Targets {
+		if strings.TrimSpace(t.URL) != "" {
+			filtered = append(filtered, t)
+		}
+	}
+	c.Heartbeat.Targets = filtered
 
 	c.applyDefaults()
 	if err := c.validate(); err != nil {
@@ -236,6 +292,20 @@ func (c *Config) applyDefaults() {
 	if c.Queue.MaxRetryAge.Duration <= 0 {
 		c.Queue.MaxRetryAge = Duration{defaultMaxRetryAge}
 	}
+	if c.Heartbeat.Interval.Duration <= 0 {
+		c.Heartbeat.Interval = Duration{60 * time.Second}
+	}
+	if c.Heartbeat.Timeout.Duration <= 0 {
+		c.Heartbeat.Timeout = Duration{10 * time.Second}
+	}
+	if c.Heartbeat.Host == "" {
+		c.Heartbeat.Host = "general-webhook"
+	}
+	for i := range c.Heartbeat.Targets {
+		if strings.TrimSpace(c.Heartbeat.Targets[i].Mode) == "" {
+			c.Heartbeat.Targets[i].Mode = "push"
+		}
+	}
 }
 
 func (c *Config) validate() error {
@@ -275,6 +345,9 @@ func (c *Config) validate() error {
 	}
 	if c.Queue.MaxRetryAge.Duration < c.Queue.RetryBase.Duration || c.Queue.MaxRetryAge.Duration > 30*24*time.Hour {
 		return fmt.Errorf("queue.max_retry_age must be >= retry_base and <= 720h")
+	}
+	if err := c.validateHeartbeat(); err != nil {
+		return err
 	}
 
 	seen := map[string]bool{}
@@ -345,6 +418,35 @@ func (c *Config) validate() error {
 			}
 		}
 
+		if s.LogPolicy != nil {
+			lp := s.LogPolicy
+			if lp.Mode != "allowlist" {
+				return fmt.Errorf("source %q: log_policy.mode must be allowlist", s.Name)
+			}
+			if len(lp.Services) == 0 {
+				return fmt.Errorf("source %q: log_policy.services must be non-empty", s.Name)
+			}
+			for i, svc := range lp.Services {
+				if strings.TrimSpace(svc) == "" {
+					return fmt.Errorf("source %q: log_policy.services[%d] is empty", s.Name, i)
+				}
+			}
+			if lp.OnReject != "" && lp.OnReject != "drop_and_count" {
+				return fmt.Errorf("source %q: log_policy.on_reject must be drop_and_count", s.Name)
+			}
+			if lp.OnReject == "" {
+				lp.OnReject = "drop_and_count"
+			}
+			if lp.Field == "" {
+				lp.Field = "service"
+			}
+		}
+		if s.Redaction != nil {
+			if err := compileRedaction(s.Redaction); err != nil {
+				return fmt.Errorf("source %q: %w", s.Name, err)
+			}
+		}
+
 		if len(s.Actions) == 0 {
 			return fmt.Errorf("source %q: no actions defined", s.Name)
 		}
@@ -384,6 +486,77 @@ func (c *Config) validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+func (c *Config) validateHeartbeat() error {
+	hb := &c.Heartbeat
+	if hb.Interval.Duration < 10*time.Second || hb.Interval.Duration > time.Hour {
+		return fmt.Errorf("heartbeat.interval must be 10s..1h")
+	}
+	if hb.Timeout.Duration < time.Second || hb.Timeout.Duration > 30*time.Second {
+		return fmt.Errorf("heartbeat.timeout must be 1s..30s")
+	}
+	if hb.Timeout.Duration > hb.Interval.Duration {
+		return fmt.Errorf("heartbeat.timeout must not exceed heartbeat.interval")
+	}
+	if strings.TrimSpace(hb.Host) == "" {
+		return fmt.Errorf("heartbeat.host must not be empty")
+	}
+	for _, r := range hb.Host {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("heartbeat.host contains control characters")
+		}
+	}
+	seen := map[string]bool{}
+	for i, t := range hb.Targets {
+		if t.Name == "" {
+			return fmt.Errorf("heartbeat.targets[%d]: name is required", i)
+		}
+		if !validSourceName(t.Name) {
+			return fmt.Errorf("heartbeat.targets[%d]: name %q invalid (use [a-zA-Z0-9_-]{1,64})", i, t.Name)
+		}
+		if seen[t.Name] {
+			return fmt.Errorf("heartbeat.targets: duplicate target name %q", t.Name)
+		}
+		seen[t.Name] = true
+
+		u, err := url.Parse(t.URL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("heartbeat.targets[%d]: invalid url %q", i, t.URL)
+		}
+		scheme := strings.ToLower(u.Scheme)
+		if scheme != "https" && !(scheme == "http" && t.AllowHTTP) {
+			return fmt.Errorf("heartbeat.targets[%d]: url must be https (or http with allow_http: true)", i)
+		}
+		if u.User != nil {
+			return fmt.Errorf("heartbeat.targets[%d]: url must not contain userinfo", i)
+		}
+		switch t.Mode {
+		case "push", "json":
+		default:
+			return fmt.Errorf("heartbeat.targets[%d]: unknown mode %q (push/json)", i, t.Mode)
+		}
+	}
+	return nil
+}
+
+func compileRedaction(r *RedactionConfig) error {
+	if r == nil {
+		return nil
+	}
+	compiled := make([]*regexp.Regexp, 0, len(r.Patterns))
+	for i, p := range r.Patterns {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("redaction.patterns[%d] is empty", i)
+		}
+		re, err := regexp.Compile(p)
+		if err != nil {
+			return fmt.Errorf("redaction.patterns[%d]: %w", i, err)
+		}
+		compiled = append(compiled, re)
+	}
+	r.Compiled = compiled
 	return nil
 }
 

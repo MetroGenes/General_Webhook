@@ -14,6 +14,7 @@ General Webhook 是一个用 Go 编写的通用 webhook 网关。它提供统一
 - 动作类型：通用 HTTP 请求（支持 Telegram/飞书/钉钉/自定义服务）+ 本地命令执行。
 - 审计记录：SQLite 保存事件、每个 action 的持久重试状态、耐久化抽取变量和已脱敏动作日志；原始 payload 是否长期保留由 `store.retain_payload` 控制。
 - 结构化日志：使用标准库 `log/slog` 输出 JSON 日志，`event_id` 同时作为 `trace_id`。
+- 死链心跳：进程周期性向外部监控端点（Healthchecks.io / Uptime Kuma / Cloudflare Pages）主动 POST 存活与队列健康信号，解决"无人监控告警中枢"的缺口；不配置 target 时模块不启动。
 
 ## 工作流程
 
@@ -60,6 +61,7 @@ worker 异步处理
 │   ├── auth/                       # HMAC / token 鉴权
 │   ├── config/                     # YAML 配置、环境变量注入、校验
 │   ├── handler/                    # http / exec 动作处理器
+│   ├── heartbeat/                  # 外部死链心跳推送 (Healthchecks/CF Pages 等)
 │   ├── logger/                     # slog JSON 日志与 trace_id
 │   ├── parser/                     # gjson 变量抽取
 │   ├── queue/                      # SQLite outbox worker、唤醒、租约与重试
@@ -218,6 +220,20 @@ queue:
   max_retry_delay: 15m
   max_retry_age: 24h
 
+heartbeat:
+  interval: 60s
+  timeout: 10s
+  host: ${HOST_LABEL}
+  targets:
+    - name: healthchecks
+      url: ${HEARTBEAT_URL}     # Healthchecks.io push URL (env, 含一次性 token)
+      token: ${HEARTBEAT_TOKEN} # 可选, 作为 X-Heartbeat-Token 头发送
+      mode: push                # push(默认) | json
+    - name: cf-pages
+      url: ${CF_HEARTBEAT_URL}  # Cloudflare Pages 心跳接收器
+      token: ${CF_HEARTBEAT_TOKEN}
+      mode: json
+
 sources:
   # 示例 1: 内部 relay 转发的 GitHub 事件 -> 飞书群机器人
   - name: github
@@ -303,6 +319,10 @@ sources:
 | `queue.retry_base` | `1s` | 指数退避基础时间 |
 | `queue.max_retry_delay` | `15m` | 抖动退避上限；服务端 `Retry-After` 不会被静默截短 |
 | `queue.max_retry_age` | `24h` | 一个事件允许自动重试的最长期限，超过后进入 `dead` |
+| `heartbeat.interval` | `60s` | 死链心跳周期（10s–1h），也是对外监控的告警时间基准 |
+| `heartbeat.timeout` | `10s` | 每个心跳 target 的 HTTP 超时（1s–30s，且不超过 interval） |
+| `heartbeat.host` | `general-webhook` | 心跳 JSON 负载里的主机标识；不固定，多机部署应每台设置唯一 `HOST_LABEL`，未设置时回退该默认值 |
+| `heartbeat.targets` | 空 | 外部监控端点列表；URL 全部为空时模块不启动（fail closed） |
 
 ### Source 配置
 
@@ -458,6 +478,43 @@ sources:
 
 变量优先来自当前 source 的 `extract` 配置；未命中时读取同名环境变量；仍不存在时为空字符串。HTTP JSON body 中的变量会按 JSON 字符串规则转义，避免消息里的引号、反斜杠或换行打坏 JSON。
 
+## 心跳模块（Deadman Heartbeat）
+
+webhook 是告警转发中枢，但标准部署不发布宿主端口，外部探针无法入站访问 `/healthz` 或 `/readyz`——"谁来监控监控者"是个真实缺口。心跳模块让进程**自己向外部监控端点主动外推存活信号**（与 Runtime 项目的 `runtime-heartbeat.sh` → Healthchecks/Uptime Kuma/Cloudflare Pages 死链模式一致，但内置在 Go 进程内，不依赖 cron 或脚本）：
+
+```text
+进程内 goroutine (周期 interval)
+  -> 评估健康: queue workers 存活 && server 未关停 && store 可读
+  -> 通过: POST url (push 模式) 或 POST 结构化 JSON (json 模式)
+  -> 不健康: POST url+/fail (push 模式) 或 status:"fail" (json 模式)
+  -> 目标返回 4xx/5xx 或网络错误: 记错误日志, 不计成功
+```
+
+- **`push` 模式（默认）**：健康时 POST 到 `url`，不健康时 POST 到 `url + "/fail"`——Healthchecks.io 的标准语义；Uptime Kuma push 对任何请求都记作一次心跳，超时未收到才告警。
+- **`json` 模式**：始终 POST 到 `url`，负载携带 `host` / `status`（`pass`/`fail`，与 Runtime `cloudflare-heartbeat` 接收器一致）/ `exit_code` / `timestamp` / `uptime_seconds` / `revision`（`GENERAL_WEBHOOK_GIT_COMMIT`）/ `stats`（队列计数、5m/1h 动作失败率、最老未完成事件年龄）/ `drop_summary`（log_policy 拒绝摘要）。
+- `host`（`heartbeat.host`，默认经 `${HOST_LABEL}` 注入）**不是固定值**：多机部署时应为每台主机设置唯一的 `HOST_LABEL` 以便区分；未设置时负载回退为固定默认 `general-webhook`。
+- 每个 target 可带 `token`，非空时作为 `X-Heartbeat-Token` 头发送。
+- 日志与错误只记录 `scheme://host[:port]`，**绝不记录 path/query**——Healthchecks/Uptime Kuma 的 push URL 自带一次性 token，绝不能进日志。
+- 出站客户端：`Proxy=nil`（不继承 `HTTP_PROXY`）、**不跟随重定向**（防止跨主机重定向把 token 头带走）、固定超时、URL 默认必须 `https`（内部 Uptime Kuma 等需显式 `allow_http: true`）、禁止 URL 内嵌 userinfo。
+- 优雅关停时**不发 fail 信号**：死链监控的 grace 吸收重启窗口，否则每次部署都会误报。首个心跳在 `interval` 之后发出，因此 grace 应大于 `interval` + 预期重启时间。
+- 命中规则：监控应覆盖两类信号——**进程消失**（心跳停止 → 死链告警）与**进程在但不健康**（心跳持续但 status=fail / `url+/fail`），后者可再叠加 Runtime 的 `HEARTBEAT_WEBHOOK_URL` 通道把失败细节送进 Telegram。
+
+示例：在 `.env` 配置（URL 未设置时模块自动关闭，无需改镜像）：
+
+```bash
+HEARTBEAT_URL=https://hc-ping.com/<check-uuid>/webhook
+HEARTBEAT_TOKEN=
+CF_HEARTBEAT_URL=https://runtime-heartbeat.pages.dev/api/heartbeat
+CF_HEARTBEAT_TOKEN=<与 CF Pages 相同的 token>
+HOST_LABEL=tokyo   # 可选: 每台主机设唯一值; 未设置时心跳 host 回退为 general-webhook
+```
+
+```bash
+# 手动验证（Healthchecks 风格）
+curl -fsS -X POST "$HEARTBEAT_URL"
+curl -fsS -X POST "$HEARTBEAT_URL/fail"
+```
+
 ## 审计与日志
 
 SQLite 会自动创建持久状态与审计表：
@@ -528,6 +585,7 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applicati
 - `general_webhook_events{status=~"dead|partial|error"} > 0`
 - `general_webhook_oldest_pending_age_milliseconds` 超过业务允许的未完成时限
 - `general_webhook_action_failure_ratio{window="5m"}` 持续升高（同时用 `general_webhook_action_attempts` 设置最小样本量）
+- `general_webhook_heartbeat_last_success_timestamp` 与当前时间差超过 `heartbeat.interval` 的若干倍（进程内观测；进程整体消失则由死链监控负责）
 
 ## 当前限制
 
@@ -535,7 +593,8 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: applicati
 - `retain_payload=false`（默认）时，命中规则的事件在 `vars_json` 和 action 状态提交成功后清除 payload，skipped 事件在提交终态后清除；预处理失败的 dead 事件通常保留 payload。已持久化变量的 dead replay 不依赖 payload；旧版本已清空且没有 `vars_json` 的事件会明确返回 `409`。
 - 规则正则在每次事件处理时编译，当前更偏向配置简单和实现直接。
 - `exec.command` 由镜像内配置控制，目前没有额外的允许目录白名单。
-- `restart: unless-stopped` 只在进程退出时重启；单纯 `unhealthy` 不会触发 Docker 自动重启，应由监控系统告警。
+- `restart: unless-stopped` 只在进程退出时重启；单纯 `unhealthy` 不会触发 Docker 自动重启。默认由心跳模块（外部死链监控）负责告警：进程消失 → 心跳停止告警，进程在但不健康 → `status=fail`；如需自动重启，应在宿主机配合 Uptime Kuma/Docker autoheal 等外部机制。
+- 心跳依赖外部监控端点可达；若宿主机整机断网或断电，心跳与告警通道可能同时失效，仍应由独立的远端探针/基础设施监控兜底（与 Runtime 的 `NETWORK_TOPOLOGY.md` 结论一致）。
 
 ## 后续方向
 

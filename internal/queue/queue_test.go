@@ -59,6 +59,94 @@ func TestProcess_LoadsPayloadFromStoreViaClaim(t *testing.T) {
 	}
 }
 
+func TestProcess_LogPolicyDropsAndRedacts(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "webhook.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	defer st.Close()
+
+	src := &config.Source{
+		Name:    "container-log",
+		Extract: map[string]string{"service": "$.service", "message": "$.message"},
+		LogPolicy: &config.LogPolicyConfig{
+			Mode:     "allowlist",
+			Field:    "service",
+			Services: []string{"edge-nginx"},
+			OnReject: "drop_and_count",
+		},
+		Redaction: &config.RedactionConfig{
+			Patterns: []string{`sk-[A-Za-z0-9]{16,}`},
+		},
+		Actions: []config.ActionConfig{{Type: "capture"}},
+	}
+	if err := compileSourceRedaction(src); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := config.SnapshotSource(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Sources: []config.Source{*src}}
+	retain := false
+	cfg.Store.RetainPayload = &retain
+
+	got := make(chan map[string]string, 1)
+	q := New(config.QueueConfig{Workers: 1, Buffer: 2, MaxRetries: 1}, handler.NewRegistry(captureHandler{got: got}), st, cfg, "owner-1")
+	q.Start(context.Background())
+
+	if err := st.SavePendingEvent(context.Background(), "drop-1", src.Name, "127.0.0.1",
+		[]byte(`{"service":"postgres","message":"x"}`), time.Now(), "", "", "hash1", snap); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SavePendingEvent(context.Background(), "ok-1", src.Name, "127.0.0.1",
+		[]byte(`{"service":"edge-nginx","message":"token sk-abcdefghijklmnopqrstuvwxyz"}`), time.Now(), "", "", "hash2", snap); err != nil {
+		t.Fatal(err)
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	select {
+	case vars := <-got:
+		if vars["message"] != "token ***" {
+			t.Fatalf("message=%q want redacted", vars["message"])
+		}
+	case <-stopCtx.Done():
+		t.Fatal("timeout waiting for allowed event")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ev, err := st.GetEvent(context.Background(), "drop-1")
+		if err == nil && ev != nil && ev.Status == "skipped" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("drop event not skipped: %+v err=%v", ev, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	summary := q.DropSummary()
+	if summary != "dropped: container-log × 1 (postgres)" {
+		t.Fatalf("summary=%q", summary)
+	}
+	_ = q.Stop(stopCtx)
+}
+
+func compileSourceRedaction(src *config.Source) error {
+	raw, err := config.SnapshotSource(src)
+	if err != nil {
+		return err
+	}
+	parsed, err := config.ParseSourceSnapshot(raw)
+	if err != nil {
+		return err
+	}
+	src.Redaction = parsed.Redaction
+	return nil
+}
+
 func TestProcess_CancelRequeuesPending(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "webhook.db"))
 	if err != nil {
