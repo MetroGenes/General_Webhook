@@ -48,6 +48,9 @@ func run() error {
 	}
 
 	log := logger.New(cfg.Log.Level)
+	if cfg.Admin.Token == "" {
+		log.Info("admin endpoints disabled: no admin token configured")
+	}
 
 	st, err := store.Open(cfg.Store.Path)
 	if err != nil {
@@ -109,15 +112,15 @@ func run() error {
 	// Deadman heartbeat: pushes liveness outward when at least one target is
 	// configured. Stopped at the start of shutdown so a graceful restart is
 	// absorbed by the monitor grace period instead of firing a false alert.
-	var stopHeartbeat context.CancelFunc = func() {}
+	var stopHeartbeat = func() {}
 	if len(cfg.Heartbeat.Targets) > 0 {
-		hbCtx, hbCancel := context.WithCancel(context.Background())
-		stopHeartbeat = hbCancel
 		hb := heartbeat.New(cfg.Heartbeat, st,
 			func() bool { return !api.Stopping() && q.Ready() },
 			q.DropSummary)
 		api.SetHeartbeat(hb)
-		hb.Start(hbCtx)
+		hb.Start(context.Background())
+		stopHeartbeat = hb.Stop
+		defer hb.Stop()
 		log.Info("heartbeat enabled", "targets", len(cfg.Heartbeat.Targets),
 			"interval", cfg.Heartbeat.Interval.Duration.String(), "host", cfg.Heartbeat.Host)
 	}
@@ -139,17 +142,17 @@ func run() error {
 	case err := <-errCh:
 		if err != nil {
 			log.Error("server error", "err", err)
-			api.SetStopping()
 			stopHeartbeat()
+			api.SetStopping()
 			cancelWorker()
 			_ = q.Stop(context.Background())
 			return fmt.Errorf("server error: %w", err)
 		}
 	}
 
-	api.SetStopping()
-	stopHeartbeat()
 	deadline := time.Now().Add(totalShutdownBudget)
+	stopHeartbeat()
+	api.SetStopping()
 	shutCtx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
 

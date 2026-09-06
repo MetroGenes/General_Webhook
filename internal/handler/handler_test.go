@@ -162,6 +162,43 @@ func TestHTTPHandle_SetsIdempotencyHeaders(t *testing.T) {
 	}
 }
 
+func TestHTTPHandle_TrustedIdentityOverridesRedactedVarsAndHeaders(t *testing.T) {
+	h := NewHTTP()
+	const eventID = "20260906T133000.123-0123456789abcdef"
+	calls := 0
+	h.client.Transport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		calls++
+		if got := req.Header.Get("Idempotency-Key"); got != eventID+":3" {
+			t.Errorf("idempotency key=%q", got)
+		}
+		if got := req.Header.Get("X-Webhook-Event-ID"); got != eventID {
+			t.Errorf("event identity=%q", got)
+		}
+		if got := req.Header.Get("X-Webhook-Attempt"); got != "2" {
+			t.Errorf("attempt=%q", got)
+		}
+		body, err := io.ReadAll(req.Body)
+		if err != nil || string(body) != `{"delivery_id":"***","message":"token ***"}` {
+			t.Errorf("body=%s err=%v", body, err)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(http.NoBody), Header: make(http.Header)}, nil
+	})
+	ctx := WithExecutionMetadata(context.Background(), ExecutionMetadata{EventID: eventID, ActionIndex: 3, Attempt: 2})
+	_, err := h.Handle(ctx, config.ActionConfig{
+		Type: "http", URL: "https://hooks.example.test/hooks",
+		Headers: map[string]string{
+			"Idempotency-Key": "${event_id}", "X-Webhook-Event-ID": "${event_id}", "X-Webhook-Attempt": "${attempt}",
+		},
+		Body: `{"delivery_id":"${delivery_id}","message":"${message}"}`,
+	}, map[string]string{
+		"event_id": "20260906T133000.123-***", "action_index": "99", "attempt": "99",
+		"delivery_id": "***", "message": "token ***",
+	})
+	if err != nil || calls != 1 {
+		t.Fatalf("calls=%d err=%v", calls, err)
+	}
+}
+
 func TestValidateURLDestination(t *testing.T) {
 	if err := ValidateURLDestination("https://api.example.com/x", nil); err != nil {
 		t.Fatal(err)

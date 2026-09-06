@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,18 +89,27 @@ func (h *HTTP) Handle(ctx context.Context, ac config.ActionConfig, vars map[stri
 		req.Header.Set(key, interpolate(v, vars))
 	}
 
-	if req.Header.Get("Idempotency-Key") == "" && vars["event_id"] != "" {
-		key := vars["event_id"]
-		if vars["action_index"] != "" {
-			key += ":" + vars["action_index"]
+	if meta, ok := ExecutionMetadataFrom(ctx); ok {
+		// Queue metadata is authoritative even when header templates refer to
+		// redacted or event-controlled values with the same names.
+		req.Header.Set("Idempotency-Key", meta.EventID+":"+strconv.Itoa(meta.ActionIndex))
+		req.Header.Set("X-Webhook-Event-ID", meta.EventID)
+		req.Header.Set("X-Webhook-Attempt", strconv.Itoa(meta.Attempt))
+	} else {
+		// Direct Handler users may still supply their own execution variables.
+		if req.Header.Get("Idempotency-Key") == "" && vars["event_id"] != "" {
+			key := vars["event_id"]
+			if vars["action_index"] != "" {
+				key += ":" + vars["action_index"]
+			}
+			req.Header.Set("Idempotency-Key", key)
 		}
-		req.Header.Set("Idempotency-Key", key)
-	}
-	if req.Header.Get("X-Webhook-Event-ID") == "" && vars["event_id"] != "" {
-		req.Header.Set("X-Webhook-Event-ID", vars["event_id"])
-	}
-	if req.Header.Get("X-Webhook-Attempt") == "" && vars["attempt"] != "" {
-		req.Header.Set("X-Webhook-Attempt", vars["attempt"])
+		if req.Header.Get("X-Webhook-Event-ID") == "" && vars["event_id"] != "" {
+			req.Header.Set("X-Webhook-Event-ID", vars["event_id"])
+		}
+		if req.Header.Get("X-Webhook-Attempt") == "" && vars["attempt"] != "" {
+			req.Header.Set("X-Webhook-Attempt", vars["attempt"])
+		}
 	}
 
 	client := h.clientFor(ac, req.URL)

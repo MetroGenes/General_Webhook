@@ -128,7 +128,7 @@ func TestProcess_LogPolicyDropsAndRedacts(t *testing.T) {
 	}
 
 	summary := q.DropSummary()
-	if summary != "dropped: container-log × 1 (postgres)" {
+	if summary != "dropped: container-log × 1" {
 		t.Fatalf("summary=%q", summary)
 	}
 	_ = q.Stop(stopCtx)

@@ -18,7 +18,7 @@ const maxExecOutput = 8 << 10 // 8 KiB runtime + stored detail cap
 //
 // 安全约束:
 //   - 不经过 shell, 命令与参数逐个传入 exec.Command, 避免命令注入;
-//   - 强制超时; Linux 下用独立进程组终止整棵子树;
+//   - 强制超时; Linux 下终止原进程组，并限时关闭仍被后代持有的输出管道;
 //   - 输出经有界 writer, 限制运行期内存;
 //   - 仅向子进程传递精简环境变量, 不继承全部父进程环境。
 type Exec struct {
@@ -50,9 +50,13 @@ func (h *Exec) Handle(ctx context.Context, ac config.ActionConfig, vars map[stri
 	for i, a := range ac.Args {
 		args[i] = interpolate(a, vars)
 	}
-	cmd := exec.Command(ac.Command, args...)
+	cmd := exec.CommandContext(cctx, ac.Command, args...)
 	cmd.Env = minimalExecEnv()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	// A descendant can create another process group/session and retain the
+	// output pipe after the command is killed or exits. Bound that wait too.
+	cmd.WaitDelay = 250 * time.Millisecond
 
 	out := &cappedWriter{limit: maxExecOutput}
 	cmd.Stdout = out
@@ -62,27 +66,29 @@ func (h *Exec) Handle(ctx context.Context, ac config.ActionConfig, vars map[stri
 		return Result{Target: ac.Command}, fmt.Errorf("exec start: %w", err)
 	}
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-
-	select {
-	case <-cctx.Done():
-		killProcessGroup(cmd)
-		<-done
-		return Result{Target: ac.Command, Detail: out.String()}, fmt.Errorf("exec timeout after %s", timeout)
-	case err := <-done:
-		if err != nil {
-			return Result{Target: ac.Command, Detail: out.String()}, fmt.Errorf("exec failed: %w", err)
+	err := cmd.Wait()
+	res := Result{Target: ac.Command, Detail: out.String()}
+	if cctx.Err() != nil {
+		if cctx.Err() == context.DeadlineExceeded {
+			return res, fmt.Errorf("exec timeout after %s: %w", timeout, cctx.Err())
 		}
-		return Result{Target: ac.Command, Detail: out.String()}, nil
+		return res, fmt.Errorf("exec canceled: %w", cctx.Err())
 	}
+	if err != nil {
+		return res, fmt.Errorf("exec failed: %w", err)
+	}
+	return res, nil
 }
 
-func killProcessGroup(cmd *exec.Cmd) {
+func killProcessGroup(cmd *exec.Cmd) error {
 	if cmd.Process == nil {
-		return
+		return os.ErrProcessDone
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	if err == syscall.ESRCH {
+		return os.ErrProcessDone
+	}
+	return err
 }
 
 func minimalExecEnv() []string {

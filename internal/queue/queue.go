@@ -84,6 +84,12 @@ func New(cfg config.QueueConfig, reg *handler.Registry, st *store.Store, sources
 	if owner == "" {
 		owner = "local"
 	}
+	var sourceNames []string
+	if sources != nil {
+		for _, source := range sources.Sources {
+			sourceNames = append(sourceNames, source.Name)
+		}
+	}
 	q := &Queue{
 		wake:          make(chan struct{}, buf),
 		workers:       workers,
@@ -98,7 +104,7 @@ func New(cfg config.QueueConfig, reg *handler.Registry, st *store.Store, sources
 		cfg:           sources,
 		stopCh:        make(chan struct{}),
 		now:           time.Now,
-		drops:         policy.NewCounters(),
+		drops:         policy.NewCounters(sourceNames...),
 	}
 	q.jitter = func(cap time.Duration) time.Duration {
 		if cap <= 0 {
@@ -188,7 +194,10 @@ func (q *Queue) drain(ctx context.Context) {
 			return
 		}
 		now := q.now()
-		_, _ = q.st.RequeueExpiredLeases(ctx, now)
+		if _, err := q.st.RequeueExpiredLeases(ctx, now); err != nil {
+			logger.From(ctx).Error("requeue expired leases", "err", err)
+			return
+		}
 		ev, err := q.st.ClaimPending(ctx, q.lease, now, q.owner)
 		if err != nil {
 			logger.From(ctx).Error("claim pending", "err", err)
@@ -316,6 +325,14 @@ func (q *Queue) process(parent context.Context, ev *store.PendingEvent, src *con
 			continue
 		}
 		now := q.now()
+		if (state.Status == "pending" || state.Status == "retrying") && !now.Before(ev.RetryStartedAt.Add(q.maxRetryAge)) {
+			if err := q.st.ExpireAction(context.WithoutCancel(ctx), ev.ID, index, now); err != nil {
+				log.Error("expire action before dispatch", "action_index", index, "err", err)
+				q.requeue(ctx, ev.ID)
+				return
+			}
+			continue
+		}
 		if state.Status == "retrying" && state.NextAttemptMS > now.UnixMilli() {
 			continue
 		}
@@ -345,7 +362,10 @@ func (q *Queue) process(parent context.Context, ev *store.PendingEvent, src *con
 		}
 
 		start := q.now()
-		res, actionErr := h.Handle(ctx, ac, attemptVars)
+		actionCtx := handler.WithExecutionMetadata(ctx, handler.ExecutionMetadata{
+			EventID: ev.ID, ActionIndex: index, Attempt: attempt,
+		})
+		res, actionErr := h.Handle(actionCtx, ac, attemptVars)
 		duration := q.now().Sub(start)
 		if actionErr == nil {
 			q.logAction(ctx, ev, index, ac.Type, res.Target, attempt, true, res.Detail, duration)
@@ -379,7 +399,7 @@ func (q *Queue) process(parent context.Context, ev *store.PendingEvent, src *con
 			delay = q.retryDelay(attempt)
 		}
 		next := q.now().Add(delay)
-		if next.After(ev.RetryStartedAt.Add(q.maxRetryAge)) {
+		if !next.Before(ev.RetryStartedAt.Add(q.maxRetryAge)) {
 			if err := q.st.DeadAction(context.WithoutCancel(ctx), ev.ID, index, "retry deadline exceeded: "+detail, q.now()); err != nil {
 				log.Error("dead-letter retry deadline", "err", err)
 				q.requeue(ctx, ev.ID)
@@ -412,8 +432,13 @@ func (q *Queue) executionVars(ctx context.Context, ev *store.PendingEvent, src *
 			_ = q.st.UpdateEventStatus(context.WithoutCancel(ctx), ev.ID, "dead", q.now())
 			return nil, false
 		}
-		vars["event_id"] = ev.ID
-		vars["delivery_id"] = ev.ExternalDeliveryID
+		if vars == nil {
+			log.Error("durable execution vars must be an object")
+			_ = q.st.UpdateEventStatus(context.WithoutCancel(ctx), ev.ID, "dead", q.now())
+			return nil, false
+		}
+		// Keep the persisted, already-redacted template values verbatim. Actual
+		// delivery identity is supplied independently in the handler context.
 		return vars, true
 	}
 	payload := ev.Payload
@@ -435,14 +460,14 @@ func (q *Queue) executionVars(ctx context.Context, ev *store.PendingEvent, src *
 	vars["event_id"] = ev.ID
 	vars["delivery_id"] = ev.ExternalDeliveryID
 
-	if rejectedValue, ok := policy.Allow(src, vars); !ok {
-		q.drops.Inc(src.Name, rejectedValue)
-		log.Info("log_policy rejected", "source", src.Name, "value", rejectedValue)
+	if _, ok := policy.Allow(src, vars); !ok {
 		if err := q.st.UpdateEventStatus(context.WithoutCancel(ctx), ev.ID, "skipped", q.now()); err != nil {
 			log.Error("mark skipped", "err", err)
 			q.requeue(ctx, ev.ID)
 			return nil, false
 		}
+		q.drops.Inc(src.Name)
+		log.Info("log_policy rejected", "source", src.Name, "reason", policy.ReasonAllowlistRejected)
 		if q.cfg != nil && q.cfg.Store.RetainPayload != nil && !*q.cfg.Store.RetainPayload {
 			if err := q.st.ClearPayload(context.WithoutCancel(ctx), ev.ID); err != nil {
 				log.Error("clear skipped payload", "err", err)

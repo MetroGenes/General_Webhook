@@ -5,9 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +19,11 @@ import (
 type Store struct {
 	db *sql.DB
 }
+
+// SQLite serializes this single-instance store through one connection. WAL
+// keeps readers from blocking commits; FULL synchronizes each accepted write.
+// Keep external-writer contention short, including during health checks.
+const sqliteBusyTimeoutMS = 250
 
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
@@ -33,22 +38,47 @@ func Open(path string) (*Store, error) {
 			_ = os.Chmod(dir, 0o700)
 		}
 	}
-	db, err := sql.Open("sqlite", path)
+	if err := prepareStoreFile(path); err != nil {
+		return nil, err
+	}
+	dsn, err := sqliteDSN(path)
+	if err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(1)
-	if err := os.Chmod(path, 0o600); err != nil && !os.IsNotExist(err) {
-		_ = db.Close()
-		return nil, fmt.Errorf("chmod store: %w", err)
-	}
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	_ = os.Chmod(path, 0o600)
+	if err := tightenStorePermissions(path); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return s, nil
+}
+
+func sqliteDSN(path string) (string, error) {
+	pragmas := url.Values{"_pragma": {
+		fmt.Sprintf("busy_timeout(%d)", sqliteBusyTimeoutMS),
+		"journal_mode(WAL)",
+		"synchronous(FULL)",
+	}}
+	// URI escaping preserves literal '?' and '#' in ordinary file names, while
+	// DSN pragmas are reapplied if database/sql has to replace the connection.
+	if path == ":memory:" {
+		return path + "?" + pragmas.Encode(), nil
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve store path: %w", err)
+	}
+	u := url.URL{Scheme: "file", Path: filepath.ToSlash(abs), RawQuery: pragmas.Encode()}
+	return u.String(), nil
 }
 
 func (s *Store) migrate() error {
@@ -107,6 +137,19 @@ CREATE TABLE IF NOT EXISTS replay_guard (
     expires_at_ms INTEGER NOT NULL,
     PRIMARY KEY(source, body_sha256)
 );
+CREATE TABLE IF NOT EXISTS _ready_check (id INTEGER PRIMARY KEY, nonce INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS heartbeat_logs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    target        TEXT NOT NULL,
+    origin        TEXT NOT NULL,
+    mode          TEXT NOT NULL,
+    health        TEXT NOT NULL,
+    error         TEXT NOT NULL,
+    http_status   INTEGER NOT NULL,
+    duration_ms   INTEGER NOT NULL,
+    created_at    DATETIME NOT NULL,
+    created_at_ms INTEGER NOT NULL
+);
 `
 	if _, err := s.db.Exec(base); err != nil {
 		return fmt.Errorf("migrate: %w", err)
@@ -124,6 +167,9 @@ CREATE TABLE IF NOT EXISTS replay_guard (
 		"action_index": "INTEGER NOT NULL DEFAULT -1", "replay_generation": "INTEGER NOT NULL DEFAULT 0",
 		"created_at_ms": "INTEGER",
 	}); err != nil {
+		return err
+	}
+	if err := s.ensureColumns("_ready_check", map[string]string{"nonce": "INTEGER NOT NULL DEFAULT 0"}); err != nil {
 		return err
 	}
 	if err := s.backfillEpochColumns(); err != nil {
@@ -145,6 +191,7 @@ CREATE INDEX IF NOT EXISTS idx_events_body_hash ON events(source, body_sha256, r
 CREATE INDEX IF NOT EXISTS idx_action_event ON action_logs(event_id);
 CREATE INDEX IF NOT EXISTS idx_action_log_created ON action_logs(created_at_ms);
 CREATE INDEX IF NOT EXISTS idx_event_actions_due ON event_actions(status, next_attempt_at_ms);
+CREATE INDEX IF NOT EXISTS idx_heartbeat_log_created ON heartbeat_logs(created_at_ms DESC, id DESC);
 `
 	if _, err := s.db.Exec(indexes); err != nil {
 		return fmt.Errorf("migrate indexes: %w", err)
@@ -443,6 +490,15 @@ func (s *Store) ClaimPending(ctx context.Context, lease time.Duration, now time.
 	if n, _ := res.RowsAffected(); n == 0 {
 		return nil, nil
 	}
+	// ClaimPending can recover an expired lease directly, without a preceding
+	// requeue pass. Restore unfinished actions in the same transaction as the
+	// new lease so a leftover 'running' state cannot strand the event. This also
+	// repairs legacy pending/retrying events with an orphaned running action.
+	if _, err := tx.ExecContext(ctx, `UPDATE event_actions SET status = 'pending', next_attempt_at_ms = NULL,
+		attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
+		WHERE event_id = ? AND status = 'running'`, ev.ID); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -450,19 +506,41 @@ func (s *Store) ClaimPending(ctx context.Context, lease time.Duration, now time.
 }
 
 func (s *Store) RequeueExpiredLeases(ctx context.Context, now time.Time) (int64, error) {
-	return s.requeueProcessing(ctx, `COALESCE(lease_until_ms, 0) < ?`, now.UnixMilli())
+	return s.requeueProcessing(ctx, false, `COALESCE(lease_until_ms, 0) < ?`, now.UnixMilli())
 }
 
+// RequeueAllProcessing is a single-instance startup recovery step. In addition
+// to old leases, recover orphaned running actions left under pending/retrying
+// events by earlier versions, while preserving terminal actions and events.
 func (s *Store) RequeueAllProcessing(ctx context.Context) (int64, error) {
-	return s.requeueProcessing(ctx, `1 = 1`)
+	return s.requeueProcessing(ctx, true, `1 = 1`)
 }
 
-func (s *Store) requeueProcessing(ctx context.Context, condition string, args ...any) (int64, error) {
+func (s *Store) requeueProcessing(ctx context.Context, recoverOrphans bool, condition string, args ...any) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var orphanCount int64
+	if recoverOrphans {
+		res, err := tx.ExecContext(ctx, `UPDATE events SET status = 'pending', next_attempt_at_ms = received_at_ms,
+			lease_until = NULL, lease_until_ms = NULL, lease_owner = NULL, processed_at = NULL, processed_at_ms = NULL
+			WHERE status IN ('pending', 'retrying') AND EXISTS
+			(SELECT 1 FROM event_actions WHERE event_id = events.id AND status = 'running')`)
+		if err != nil {
+			return 0, err
+		}
+		orphanCount, err = res.RowsAffected()
+		if err != nil {
+			return 0, err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE event_actions SET status = 'pending', next_attempt_at_ms = NULL,
+			attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
+			WHERE status = 'running' AND event_id IN (SELECT id FROM events WHERE status = 'pending')`); err != nil {
+			return 0, err
+		}
+	}
 	queryArgs := append([]any{}, args...)
 	if _, err := tx.ExecContext(ctx, `UPDATE event_actions SET status = 'pending', next_attempt_at_ms = NULL,
 		attempt_count = CASE WHEN attempt_count > 0 THEN attempt_count - 1 ELSE 0 END
@@ -482,7 +560,7 @@ func (s *Store) requeueProcessing(ctx context.Context, condition string, args ..
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return n, nil
+	return n + orphanCount, nil
 }
 
 func (s *Store) RequeueEvent(ctx context.Context, id string) error {
@@ -625,6 +703,23 @@ func (s *Store) ScheduleActionRetry(ctx context.Context, eventID string, index i
 func (s *Store) DeadAction(ctx context.Context, eventID string, index int, detail string, now time.Time) error {
 	return s.updateRunningAction(ctx, eventID, index, `status = 'dead', next_attempt_at_ms = NULL,
 		last_error = ?, retry_after_ms = NULL, completed_at_ms = ?`, detail, now.UnixMilli())
+}
+
+// ExpireAction records a retry-age deadline before dispatch, without counting
+// an attempt or changing actions which have already completed. A single UPDATE
+// atomically transitions pending/retrying state; RefreshEventStatus aggregates
+// the event after all eligible actions have been considered.
+func (s *Store) ExpireAction(ctx context.Context, eventID string, index int, now time.Time) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE event_actions SET status = 'dead', next_attempt_at_ms = NULL,
+		last_error = 'maximum retry age exceeded', retry_after_ms = NULL, completed_at_ms = ?
+		WHERE event_id = ? AND action_index = ? AND status IN ('pending', 'retrying')`, now.UnixMilli(), eventID, index)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("action %s/%d not pending or retrying", eventID, index)
+	}
+	return nil
 }
 
 func (s *Store) updateRunningAction(ctx context.Context, eventID string, index int, assignment string, args ...any) error {
@@ -870,21 +965,19 @@ func parseSQLiteTime(raw string) (time.Time, error) {
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
 func (s *Store) ReadyCheck(ctx context.Context) error {
-	if err := s.Ping(ctx); err != nil {
-		return err
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _ready_check (id INTEGER PRIMARY KEY)`); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _ready_check(id) VALUES (1) ON CONFLICT(id) DO UPDATE SET id = 1`); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.withDeadlineWriter(ctx, func(conn *sql.Conn) error {
+		tx, err := conn.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		// Toggle a stored value so repeated probes still commit a real write.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO _ready_check(id, nonce) VALUES (1, 1)
+			ON CONFLICT(id) DO UPDATE SET nonce = 1 - nonce`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	})
 }
 
 func (s *Store) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, error) {
@@ -906,6 +999,9 @@ func (s *Store) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, er
 		return 0, err
 	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM replay_guard WHERE expires_at_ms < ?`, time.Now().UnixMilli()); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM heartbeat_logs WHERE created_at_ms < ?`, cutoff.UnixMilli()); err != nil {
 		return 0, err
 	}
 	n, err := res.RowsAffected()
@@ -937,49 +1033,6 @@ func (s *Store) RenewLease(ctx context.Context, id string, lease time.Duration, 
 func (s *Store) ClearPayload(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE events SET payload = NULL WHERE id = ?`, id)
 	return err
-}
-
-// RewriteActionSnapshots rewrites persisted execution plans without exposing
-// them to callers. It is used at startup to replace credentials persisted by
-// older versions with runtime secret references.
-func (s *Store) RewriteActionSnapshots(ctx context.Context, rewrite func(string) (string, error)) (int64, error) {
-	if rewrite == nil {
-		return 0, nil
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, actions_json FROM events WHERE actions_json IS NOT NULL AND actions_json != ''`)
-	if err != nil {
-		return 0, err
-	}
-	type snapshotRow struct{ id, raw string }
-	var snapshots []snapshotRow
-	for rows.Next() {
-		var row snapshotRow
-		if err := rows.Scan(&row.id, &row.raw); err != nil {
-			_ = rows.Close()
-			return 0, err
-		}
-		snapshots = append(snapshots, row)
-	}
-	if err := rows.Close(); err != nil {
-		return 0, err
-	}
-	// Deterministic order makes migrations and tests reproducible.
-	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].id < snapshots[j].id })
-	var changed int64
-	for _, row := range snapshots {
-		updated, err := rewrite(row.raw)
-		if err != nil {
-			return changed, fmt.Errorf("rewrite snapshot %s: %w", row.id, err)
-		}
-		if updated == row.raw {
-			continue
-		}
-		if _, err := s.db.ExecContext(ctx, `UPDATE events SET actions_json = ? WHERE id = ?`, updated, row.id); err != nil {
-			return changed, err
-		}
-		changed++
-	}
-	return changed, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

@@ -28,6 +28,10 @@ func ValidateURLDestinationWithPolicy(raw string, allowlist []string, allowPriva
 	if scheme != "http" && scheme != "https" {
 		return fmt.Errorf("url scheme %q not allowed", scheme)
 	}
+	canonicalPath, err := canonicalURLPath(u)
+	if err != nil {
+		return err
+	}
 	host := normalizeHostname(u.Hostname())
 	if host == "" {
 		return fmt.Errorf("invalid url host")
@@ -49,14 +53,14 @@ func ValidateURLDestinationWithPolicy(raw string, allowlist []string, allowPriva
 	}
 
 	for _, entry := range allowlist {
-		if matchAllowlistEntry(u, strings.TrimSpace(entry)) {
+		if matchAllowlistEntry(u, canonicalPath, strings.TrimSpace(entry)) {
 			return nil
 		}
 	}
 	return fmt.Errorf("destination not in url_allowlist")
 }
 
-func matchAllowlistEntry(u *url.URL, entry string) bool {
+func matchAllowlistEntry(u *url.URL, canonicalPath, entry string) bool {
 	if entry == "" {
 		return false
 	}
@@ -76,7 +80,8 @@ func matchAllowlistEntry(u *url.URL, entry string) bool {
 		if effectivePort(u) != effectivePort(allowed) {
 			return false
 		}
-		return pathPrefixMatch(u.EscapedPath(), allowed.EscapedPath())
+		allowedPath, err := canonicalURLPath(allowed)
+		return err == nil && pathPrefixMatch(canonicalPath, allowedPath)
 	}
 
 	// Exact host or host:port. A host entry permits either http or https; the
@@ -85,6 +90,45 @@ func matchAllowlistEntry(u *url.URL, entry string) bool {
 		return true
 	}
 	return !strings.Contains(entry, ":") && normalizeHostname(u.Hostname()) == normalizeHostname(entry) && u.Port() == ""
+}
+
+// canonicalURLPath uses one decoding/cleaning policy for both the destination
+// and allowlist prefixes. Encoded separators, encoded dot segments, backslashes,
+// and nested escapes are rejected because intermediaries can interpret them
+// differently. A literal percent (e.g. 100%25) remains valid unless decoding it
+// reveals another complete escape sequence.
+func canonicalURLPath(u *url.URL) (string, error) {
+	escaped := u.EscapedPath()
+	decoded, err := url.PathUnescape(escaped)
+	if err != nil {
+		return "", fmt.Errorf("invalid url path encoding")
+	}
+	if strings.ContainsRune(decoded, '\\') || containsPercentEscape(decoded) {
+		return "", fmt.Errorf("ambiguous url path encoding is not allowed")
+	}
+	for _, segment := range strings.Split(escaped, "/") {
+		value, err := url.PathUnescape(segment)
+		if err != nil {
+			return "", fmt.Errorf("invalid url path encoding")
+		}
+		if strings.ContainsRune(value, '/') || (value == "." || value == "..") && segment != value {
+			return "", fmt.Errorf("encoded path separators or dot segments are not allowed")
+		}
+	}
+	return path.Clean("/" + strings.TrimPrefix(decoded, "/")), nil
+}
+
+func containsPercentEscape(value string) bool {
+	for i := 0; i+2 < len(value); i++ {
+		if value[i] == '%' && isHexDigit(value[i+1]) && isHexDigit(value[i+2]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHexDigit(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
 }
 
 func pathPrefixMatch(got, prefix string) bool {

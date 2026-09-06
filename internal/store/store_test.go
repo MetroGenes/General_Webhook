@@ -172,6 +172,8 @@ CREATE TABLE action_logs (
     duration_ms INTEGER,
     created_at DATETIME NOT NULL
 );
+CREATE TABLE _ready_check (id INTEGER PRIMARY KEY);
+INSERT INTO _ready_check(id) VALUES (1);
 INSERT INTO events(id, source, remote_ip, payload, status, received_at)
 VALUES ('legacy-log', 'src', '1.1.1.1', '{}', 'done', datetime('now'));
 INSERT INTO action_logs(event_id, action, target, attempt, success, detail, duration_ms, created_at)
@@ -187,6 +189,9 @@ VALUES ('legacy-log', 'http', 'https://example.test', 1, 0, 'failed', 10,
 		t.Fatalf("Open migrated: %v", err)
 	}
 	defer s.Close()
+	if err := s.ReadyCheck(context.Background()); err != nil {
+		t.Fatalf("legacy readiness table did not migrate: %v", err)
+	}
 	if err := s.SavePendingEvent(context.Background(), "n1", "s", "1.1.1.1", []byte(`{}`), time.Now(), "d1", "", "", ""); err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -29,32 +31,34 @@ const maxBodyBytes = 1 << 20
 const (
 	defaultReplaySkew   = 5 * time.Minute
 	defaultReplayTTL    = 10 * time.Minute
-	defaultRateBurst    = 30
-	defaultGlobalBurst  = 120
 	maxDeliveryIDLength = 128
 )
 
 var deliveryIDRe = regexp.MustCompile(`^[A-Za-z0-9._:-]+$`)
 
 type Server struct {
-	cfg      *config.Config
-	q        *queue.Queue
-	st       *store.Store
-	limiter  *rateLimiter
-	global   *rateLimiter
-	ops      *rateLimiter
-	budget   *inFlightBudget
-	trusted  *trustedNets
-	now      func() time.Time
-	stopping atomic.Bool
-	hb       *heartbeat.Monitor
+	cfg          *config.Config
+	q            *queue.Queue
+	st           *store.Store
+	limiter      *rateLimiter
+	global       *rateLimiter
+	preAuth      *rateLimiter
+	ops          *rateLimiter
+	budget       *inFlightBudget
+	trusted      *trustedNets
+	now          func() time.Time
+	stopping     atomic.Bool
+	hb           *heartbeat.Monitor
+	rateRejected [4]atomic.Uint64
 }
 
 func New(cfg *config.Config, q *queue.Queue, st *store.Store) *Server {
 	maxInFlight := 16
 	maxBytes := 32 << 20
 	var proxies []string
+	rates := (config.RateLimitsConfig{}).WithDefaults()
 	if cfg != nil {
+		rates = cfg.Server.RateLimit.WithDefaults()
 		if cfg.Server.MaxInFlight > 0 {
 			maxInFlight = cfg.Server.MaxInFlight
 		}
@@ -70,9 +74,10 @@ func New(cfg *config.Config, q *queue.Queue, st *store.Store) *Server {
 		cfg:     cfg,
 		q:       q,
 		st:      st,
-		limiter: newRateLimiter(defaultRateBurst, float64(defaultRateBurst)/60),
-		global:  newRateLimiter(defaultGlobalBurst, float64(defaultGlobalBurst)/60),
-		ops:     newRateLimiter(60, 1),
+		limiter: newRateLimiter(rates.SourcePerIP.Burst, rates.SourcePerIP.PerSecond),
+		global:  newRateLimiter(rates.Global.Burst, rates.Global.PerSecond),
+		preAuth: newRateLimiter(rates.PreAuthPerIP.Burst, rates.PreAuthPerIP.PerSecond),
+		ops:     newRateLimiter(rates.AdminPerIP.Burst, rates.AdminPerIP.PerSecond),
 		budget:  newInFlightBudget(maxInFlight, maxBytes),
 		trusted: parseTrustedProxies(proxies),
 		now:     time.Now,
@@ -104,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("POST /events/{id}/retry", s.requireAdmin(s.retryEvent))
 		mux.HandleFunc("GET /queue/stats", s.requireAdmin(s.queueStats))
 		mux.HandleFunc("GET /metrics", s.requireAdmin(s.metrics))
+		mux.HandleFunc("GET /heartbeat/logs", s.requireAdmin(s.heartbeatLogs))
 	}
 	return mux
 }
@@ -123,7 +129,9 @@ func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "workers not ready", http.StatusServiceUnavailable)
 		return
 	}
-	if err := s.st.ReadyCheck(r.Context()); err != nil {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.st.ReadyCheck(ctx); err != nil {
 		http.Error(w, "store not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -144,8 +152,9 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := s.now()
-	if !s.global.allow("global", now) {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+	ip := clientIP(r, s.trusted)
+	if !s.preAuth.allow(ip, now) {
+		s.rejectRate(w, 0)
 		return
 	}
 	if r.ContentLength > maxBodyBytes {
@@ -182,9 +191,12 @@ func (s *Server) webhook(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
-	ip := clientIP(r, s.trusted)
 	if !s.limiter.allow(name+"|"+ip, now) {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		s.rejectRate(w, 2)
+		return
+	}
+	if !s.global.allow("global", now) {
+		s.rejectRate(w, 1)
 		return
 	}
 	if !json.Valid(body) {
@@ -341,7 +353,9 @@ func (s *Server) queueStats(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.st.Stats(r.Context(), s.now())
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	stats, err := s.st.Stats(ctx, s.now())
 	if err != nil {
 		http.Error(w, "store error", http.StatusInternalServerError)
 		return
@@ -375,21 +389,29 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "# TYPE general_webhook_oldest_pending_age_milliseconds gauge\n")
 	_, _ = fmt.Fprintf(w, "general_webhook_oldest_pending_age_milliseconds %d\n", stats.OldestPendingAgeMS)
 	if s.q != nil {
-		_, _ = io.WriteString(w, "# HELP general_webhook_policy_drops_total Allowlist rejections by source and value.\n")
+		_, _ = io.WriteString(w, "# HELP general_webhook_policy_drops_total Allowlist rejections by configured source and bounded reason.\n")
 		_, _ = io.WriteString(w, "# TYPE general_webhook_policy_drops_total counter\n")
-		for src, byVal := range s.q.DropSnapshot() {
-			for value, n := range byVal {
-				_, _ = fmt.Fprintf(w, "general_webhook_policy_drops_total{source=%q,value=%q} %d\n", src, value, n)
+		snapshot := s.q.DropSnapshot()
+		sources := make([]string, 0, len(snapshot))
+		for src := range snapshot {
+			sources = append(sources, src)
+		}
+		sort.Strings(sources)
+		for _, src := range sources {
+			for reason, n := range snapshot[src] {
+				_, _ = fmt.Fprintf(w, "general_webhook_policy_drops_total{source=%s,reason=%s} %d\n", prometheusQuote(src), prometheusQuote(reason), n)
 			}
 		}
-		_, _ = io.WriteString(w, "# HELP general_webhook_policy_drops_summary Human-readable drop summary for heartbeats.\n")
-		_, _ = io.WriteString(w, "# TYPE general_webhook_policy_drops_summary gauge\n")
-		_, _ = fmt.Fprintf(w, "# %s\n", s.q.DropSummary())
+	}
+	_, _ = io.WriteString(w, "# HELP general_webhook_rate_limit_rejections_total Requests rejected by rate limit layer.\n# TYPE general_webhook_rate_limit_rejections_total counter\n")
+	for i, reason := range []string{"pre_auth_ip", "authenticated_global", "source_ip", "admin_ip"} {
+		_, _ = fmt.Fprintf(w, "general_webhook_rate_limit_rejections_total{layer=%s} %d\n", prometheusQuote(reason), s.rateRejected[i].Load())
 	}
 	if s.hb != nil {
 		_, _ = io.WriteString(w, "# HELP general_webhook_heartbeat_last_success_timestamp Unix seconds of the last deadman heartbeat push accepted by any target (0 = never).\n")
 		_, _ = io.WriteString(w, "# TYPE general_webhook_heartbeat_last_success_timestamp gauge\n")
 		_, _ = fmt.Fprintf(w, "general_webhook_heartbeat_last_success_timestamp %d\n", s.hb.LastSuccess())
+		s.heartbeatMetrics(w)
 	}
 }
 
@@ -397,7 +419,7 @@ func (s *Server) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := clientIP(r, s.trusted)
 		if !s.ops.allow(ip, s.now()) {
-			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			s.rejectRate(w, 3)
 			return
 		}
 		got := strings.TrimSpace(r.Header.Get(s.cfg.Admin.Header))
@@ -470,11 +492,8 @@ func validateReplayHeaders(r *http.Request, now time.Time, skew time.Duration) e
 	if err != nil {
 		return errInvalidTimestamp
 	}
-	delta := now.Sub(time.Unix(seconds, 0))
-	if delta < 0 {
-		delta = -delta
-	}
-	if delta > skew {
+	stamp := time.Unix(seconds, 0)
+	if stamp.Before(now.Add(-skew)) || stamp.After(now.Add(skew)) {
 		return errStaleTimestamp
 	}
 	return nil

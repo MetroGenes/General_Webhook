@@ -2,13 +2,16 @@ name: general-webhook
 
 services:
   webhook:
+    # Official image: compose pull, then up --no-build.
+    # Custom configs/scripts: set a unique local WEBHOOK_IMAGE before building.
     build:
       context: .
       dockerfile: Dockerfile
       args:
         WEBHOOK_UID: ${WEBHOOK_UID:-10001}
         WEBHOOK_GID: ${WEBHOOK_GID:-10001}
-    image: ${WEBHOOK_IMAGE:?set WEBHOOK_IMAGE to a unique version tag}
+        VCS_REF: ${GENERAL_WEBHOOK_GIT_COMMIT:-unknown}
+    image: ${WEBHOOK_IMAGE:?set WEBHOOK_IMAGE to a GHCR deployment tag or a custom image tag}
     user: "${WEBHOOK_UID:-10001}:${WEBHOOK_GID:-10001}"
     restart: unless-stopped
     init: true
@@ -50,13 +53,13 @@ services:
       TG_CHAT_ID: ${TG_CHAT_ID:-}
       DINGTALK_TOKEN: ${DINGTALK_TOKEN:-}
       DINGTALK_WEBHOOK_TOKEN: ${DINGTALK_WEBHOOK_TOKEN:-}
-      # Deadman heartbeat (optional; module stays off when no URL is set)
+      # Kuma push by default; module stays off when no URL is set.
+      # Internal HTTP requires allow_http: true in the baked configuration.
       HEARTBEAT_URL: ${HEARTBEAT_URL:-}
       HEARTBEAT_TOKEN: ${HEARTBEAT_TOKEN:-}
       CF_HEARTBEAT_URL: ${CF_HEARTBEAT_URL:-}
       CF_HEARTBEAT_TOKEN: ${CF_HEARTBEAT_TOKEN:-}
       HOST_LABEL: ${HOST_LABEL:-}
-      GENERAL_WEBHOOK_GIT_COMMIT: ${GENERAL_WEBHOOK_GIT_COMMIT:-}
     networks:
       webhook-internal:
         aliases:
@@ -83,7 +86,7 @@ networks:
     name: ${WEBHOOK_INTERNAL_NETWORK:-webhook-internal}
     external: true
 
-  # Webhook joins this separate network only for outbound HTTP actions.
+  # Webhook joins this separate network for outbound HTTP actions and heartbeats.
   # No other application should normally join it.
   webhook-egress:
     name: ${WEBHOOK_EGRESS_NETWORK:-webhook-egress}

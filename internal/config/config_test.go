@@ -254,8 +254,8 @@ heartbeat:
 	if cfg.Heartbeat.Targets[0].Token != "hb-token-123456" {
 		t.Errorf("token = %q", cfg.Heartbeat.Targets[0].Token)
 	}
-	if cfg.Heartbeat.Targets[0].Mode != "push" {
-		t.Errorf("mode = %q, want default push", cfg.Heartbeat.Targets[0].Mode)
+	if cfg.Heartbeat.Targets[0].Mode != "kuma" {
+		t.Errorf("mode = %q, want default kuma", cfg.Heartbeat.Targets[0].Mode)
 	}
 }
 

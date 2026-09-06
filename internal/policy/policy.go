@@ -6,44 +6,52 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/MetroGenes/General_Webhook/internal/config"
 )
 
-// Counters tracks allowlist rejections for heartbeat /metrics.
+const (
+	ReasonAllowlistRejected = "allowlist_rejected"
+	UnknownSource           = "other"
+	maxSummarySources       = 10
+)
+
+// Counters tracks committed allowlist rejections for heartbeat /metrics. Its
+// dimensions are fixed at construction; event values never become map keys.
 type Counters struct {
-	mu   sync.Mutex
-	data map[string]map[string]*atomic.Uint64 // source -> value -> count
+	mu      sync.Mutex
+	data    map[string]uint64
+	sources []string
 }
 
-func NewCounters() *Counters {
-	return &Counters{data: map[string]map[string]*atomic.Uint64{}}
+func NewCounters(sources ...string) *Counters {
+	c := &Counters{data: map[string]uint64{UnknownSource: 0}}
+	for _, source := range sources {
+		if validSourceName(source) {
+			c.data[source] = 0
+		}
+	}
+	for source := range c.data {
+		c.sources = append(c.sources, source)
+	}
+	sort.Strings(c.sources)
+	return c
 }
 
-func (c *Counters) Inc(source, value string) {
+func (c *Counters) Inc(source string) {
 	if c == nil {
 		return
 	}
-	if value == "" {
-		value = "(empty)"
-	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	byVal, ok := c.data[source]
-	if !ok {
-		byVal = map[string]*atomic.Uint64{}
-		c.data[source] = byVal
+	if _, ok := c.data[source]; !ok {
+		source = UnknownSource
 	}
-	ctr, ok := byVal[value]
-	if !ok {
-		ctr = &atomic.Uint64{}
-		byVal[value] = ctr
-	}
-	ctr.Add(1)
+	c.data[source]++
 }
 
-// Snapshot returns source -> value -> count.
+// Snapshot returns source -> fixed reason -> count. Sources removed from the
+// active configuration, including old durable snapshots, share the other bucket.
 func (c *Counters) Snapshot() map[string]map[string]uint64 {
 	out := map[string]map[string]uint64{}
 	if c == nil {
@@ -51,41 +59,56 @@ func (c *Counters) Snapshot() map[string]map[string]uint64 {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for src, byVal := range c.data {
-		inner := map[string]uint64{}
-		for v, ctr := range byVal {
-			inner[v] = ctr.Load()
+	for src, count := range c.data {
+		if count > 0 {
+			out[src] = map[string]uint64{ReasonAllowlistRejected: count}
 		}
-		out[src] = inner
 	}
 	return out
 }
 
-// Summary formats drop counters for heartbeats, e.g.
-// "dropped: container-log × 37 (foo, postgres)".
+// Summary includes at most ten configured source names, each limited to 64
+// ASCII bytes. The remaining counts are aggregated, keeping it below 1 KiB
+// regardless of the number or size of rejected events or configured sources.
 func (c *Counters) Summary() string {
-	snap := c.Snapshot()
-	if len(snap) == 0 {
+	if c == nil {
 		return "dropped: none"
 	}
-	sources := make([]string, 0, len(snap))
-	for s := range snap {
-		sources = append(sources, s)
-	}
-	sort.Strings(sources)
-	parts := make([]string, 0, len(sources))
-	for _, src := range sources {
-		byVal := snap[src]
-		var total uint64
-		vals := make([]string, 0, len(byVal))
-		for v, n := range byVal {
-			total += n
-			vals = append(vals, v)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	parts := make([]string, 0, maxSummarySources+1)
+	var rest uint64
+	for _, src := range c.sources {
+		count := c.data[src]
+		if count == 0 {
+			continue
 		}
-		sort.Strings(vals)
-		parts = append(parts, fmt.Sprintf("%s × %d (%s)", src, total, strings.Join(vals, ", ")))
+		if len(parts) < maxSummarySources {
+			parts = append(parts, fmt.Sprintf("%s × %d", src, count))
+		} else {
+			rest += count
+		}
+	}
+	if rest > 0 {
+		parts = append(parts, fmt.Sprintf("remaining sources × %d", rest))
+	}
+	if len(parts) == 0 {
+		return "dropped: none"
 	}
 	return "dropped: " + strings.Join(parts, "; ")
+}
+
+func validSourceName(source string) bool {
+	if len(source) == 0 || len(source) > 64 {
+		return false
+	}
+	for _, c := range source {
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Allow reports whether vars pass the source log_policy allowlist.

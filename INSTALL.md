@@ -1,13 +1,13 @@
 # General Webhook 部署指南
 
-本项目的**唯一**推荐生产部署方式：通过 Dockerfile 构建镜像，并使用 Docker Compose 运行。不支持裸机二进制、systemd 或宿主机同步脚本。
+推荐使用 Docker Compose 运行。默认拉取 `ghcr.io/metrogenes/general_webhook:1.0.0`，支持 amd64/arm64；需要定制配置或脚本时，通过 Dockerfile 构建自己的唯一标签镜像。
 
 ## 部署原则
 
 - 不配置 `ports`，不发布任何宿主机端口。
 - 不接入公网反向代理或公网入口网络。
 - 只有经过批准的生产者容器加入 `webhook-internal`。
-- Webhook 通过独立的 `webhook-egress` 网络执行必要的出站 HTTP 请求。
+- Webhook 通过独立的 `webhook-egress` 网络执行 HTTP action 和主动心跳请求。
 - 镜像内置配置和脚本；修改后必须重新构建镜像。
 - 容器固定以 10001:10001 非 root 用户运行，根文件系统只读。
 - 默认限制为 0.5 CPU、256 MiB RAM+swap 总量、64 个 PID 和有界日志。
@@ -25,16 +25,20 @@ chmod 600 .env
 
 若当前 Compose 不识别这些参数或配置字段，应先升级 Compose，不要通过删除健康等待或自动建数据目录来绕过。
 
-`.env.example` 中的 source secret、action token 与 `ADMIN_TOKEN` 默认留空。编辑 `.env`，为管理接口设置至少 16 字节的独立随机 token，并只填写实际启用 source 所需的值；未使用的 source 应从 `configs/webhooks.yaml` 删除并重新构建镜像。不要复用 source token，也不要把 `.env` 加入镜像或版本库。
+`.env.example` 中的 source secret、action token 与 `ADMIN_TOKEN` 默认留空。编辑 `.env`，为管理接口设置至少 16 字节的独立随机 token，并填写镜像内所有已启用 source/action 所需的值。官方示例包含 `github`、`custom`、`bt`、`dingtalk-demo`；需删减时修改 `configs/webhooks.yaml` 并按第 4 节构建自己的镜像。凭据含 `$` 时在 `.env` 用单引号包裹，避免 Compose 提前插值。不要复用管理和 source token，也不要把 `.env` 加入镜像或版本库。
 
-Deadman 心跳（可选）：`HEARTBEAT_URL` / `CF_HEARTBEAT_URL` 等全部留空时心跳模块不启动，无需改动镜像；启用时参考 README「心跳模块」一节。多机部署时为每台主机设置唯一的 `HOST_LABEL`（未设置则回退 `general-webhook`）。
+主动心跳（可选）：`HEARTBEAT_URL` / `CF_HEARTBEAT_URL` 全部留空时模块不启动。默认目标是 Uptime Kuma Push，复制 Kuma 创建监控项后生成的 `https://.../api/push/<token>?status=up&msg=OK&ping=` 到 `HEARTBEAT_URL`。每个实例使用独立监控项和唯一 `HOST_LABEL`（最多 128 字节，缺省为 `general-webhook`）。
 
-正式发布必须使用唯一版本或提交哈希，不使用可漂移的 `latest`：
+`.env` 的默认镜像设置：
 
 ~~~dotenv
-WEBHOOK_IMAGE=general-webhook:git-a1b2c3d
+WEBHOOK_IMAGE=ghcr.io/metrogenes/general_webhook:1.0.0
 WEBHOOK_DATA_DIR=/data/webhook
 ~~~
+
+主分支通过全部 CI 后更新 `1.0.0` 和 `latest`，并发布 `sha-<完整提交 SHA>`。`1.0.0` 是按部署约定可更新的标签；按提交标签可定位代码版本，完全固定产物应使用镜像 digest。旧 Git `v1.0.0` 标签保留原提交。升级前记录正在运行的镜像 digest 或已验证提交标签，便于回滚。
+
+内置 GitHub relay 示例已启用 `signed_headers: [timestamp, delivery_id, body]`。relay 应先验证 GitHub 上游签名，再用本服务共享 secret 对 `timestamp + "\n" + delivery_id + "\n" + 原始 body` 重签。升级旧 relay 时必须同步改签名；需要维持旧 body-only 协议时，在自有配置中显式设 `signed_headers: []` 并重建，该协议仍不绑定时间戳和 delivery ID。
 
 下文命令使用标准的 `/data/webhook`、`10001:10001` 和 `webhook-internal`。若覆盖这些值，必须把所有目录准备、备份、网络创建及生产者 Compose 示例同步改成实际值，不能只修改 `.env`。
 
@@ -75,14 +79,31 @@ fi
 
 不要将 `webhook-internal` 改成普通公共 bridge，也不要添加 `0.0.0.0:8080:8080`、`network_mode: host`、公网入口网络或公网反向代理。
 
-## 4. 校验并构建
+## 4. 校验并拉取镜像
+
+~~~bash
+docker compose --env-file .env config -q
+docker compose --env-file .env pull webhook
+~~~
+
+`config -q` 只校验，不把展开后的 secret 输出到终端或 CI 日志。使用官方镜像无需本机安装 Go，下一步用 `up --no-build` 启动。
+
+配置和 scripts 已烘焙进镜像。定制 `configs/webhooks.yaml`、`scripts/`、UID/GID，或为内部 HTTP Kuma 开启 `allow_http: true` 时，先将 `.env` 改为自己的唯一标签：
+
+~~~dotenv
+WEBHOOK_IMAGE=general-webhook:local-20260906-01
+# 可选：填当前完整提交 SHA，仅用于本地构建的 VCS_REF
+GENERAL_WEBHOOK_GIT_COMMIT=
+~~~
+
+然后构建并执行第 5 节启动命令：
 
 ~~~bash
 docker compose --env-file .env config -q
 docker compose --env-file .env build --pull
 ~~~
 
-`config -q` 只校验，不把展开后的 secret 输出到终端或 CI 日志。配置和 scripts 已烘焙进镜像；修改 `configs/webhooks.yaml` 或 `scripts/` 后必须使用新标签重新构建。
+每次定制构建都使用新标签。Docker builder 使用 `golang:alpine` 并拉取最新基础镜像；远端 CI 使用 Go `stable` + `check-latest`，`go.mod` 的 `1.26.6` 只是最低要求。本次本机测试工具链为 Go `1.27.1`。官方镜像自带 revision；Compose 的 `GENERAL_WEBHOOK_GIT_COMMIT` 只传给 `build.args.VCS_REF`，不覆盖官方镜像的运行环境。
 
 ## 5. 启动并等待健康
 
@@ -150,9 +171,17 @@ networks:
 
 健康检查访问 `/readyz` 并验证 worker 存活及 SQLite 可写。`restart: unless-stopped` 只会在进程退出时重启；单纯 `unhealthy` 不会自动重启，应由监控系统告警。容器停止宽限期为 45 秒，用于完成应用最长 35 秒的关停流程。Prometheus 抓取 `/metrics` 时必须携带管理 Bearer token，并至少对 `dead/partial/error > 0`、最老未完成事件超时和 5 分钟 action 失败率设置告警。
 
+Kuma 的 `up` 表示本地就绪检查通过，动作交付、队列积压和 worker 进展需另设告警。心跳目标最多 16 个，各自独立调度；健康采样和发送各最多 `T=heartbeat.timeout`，失败日志另有 `min(T,1s)` SQL 预算，一轮最多 `2T+min(T,1s)`。宽限应覆盖 interval、最坏单轮耗时和预期重启时间，正常停止不会主动发送 down。
+
+内部 HTTP Kuma 需要受控网络互通，并在镜像配置中显式设置 `allow_http: true` 后重建自有镜像；仅修改 `.env` URL 不会开启 HTTP。继续使用 Healthchecks 时设 `mode: healthchecks`（旧 `push` 是其别名），UUID URL 为 `https://hc-ping.com/<check-uuid>`；JSON 接收器使用 `mode: json`。省略 mode 的旧配置升级后会改用 Kuma。
+
+失败 push 同时写 stdout 和 `heartbeat_logs`。从受控运维网络携带管理 token 访问 `GET /heartbeat/logs?limit=20` 可查看最近错误，limit 范围 1–100。记录包含目标名称、origin、协议、健康值、错误类别、HTTP 状态和耗时，不包含 URL path/query、token 头或响应体。数据库不可写时只能回退 stdout，并增加 `general_webhook_heartbeat_target_log_failures_total`；也应监控每目标 push failures/last success。
+
+入口 `server.rate_limit` 可配置鉴权前 IP、认证后全局、source/IP 与管理 IP 四层容量；未认证流量不消费认证后的全局额度。通过 `general_webhook_rate_limit_rejections_total{layer}` 观察 429，并确保生产者执行退避重投。默认值与完整指标见 [README](README.md#运维接口)。
+
 ## 8. 更新、回滚与数据
 
-升级前先做一致性备份。以下路径按标准值示例；若修改了 `WEBHOOK_DATA_DIR`，必须替换为对应的已核对路径：
+SQLite 使用 WAL、FULL 同步和 250ms 锁等待；数据库及 `-wal` / `-shm` 文件权限为 `0600`。升级前先做一致性备份：停机后复制整个数据目录，或使用 SQLite 备份 API，运行中单独复制 `.db` 不足以保存 WAL 中已提交的数据。以下路径按标准值示例；若修改了 `WEBHOOK_DATA_DIR`，必须替换为对应的已核对路径：
 
 ~~~bash
 docker compose --env-file .env stop webhook
@@ -164,18 +193,22 @@ docker compose --env-file .env start webhook
 echo "backup: $backup_dir"
 ~~~
 
-更新 `.env` 中的 `WEBHOOK_IMAGE` 为新且唯一的标签，然后构建、校验并替换：
+使用官方部署标签更新时，校验、重新拉取并替换容器：
 
 ~~~bash
 docker compose --env-file .env config -q
-docker compose --env-file .env build --pull
+docker compose --env-file .env pull webhook
 docker compose --env-file .env up -d --no-build --remove-orphans --wait --wait-timeout 60
 ~~~
 
-回滚时，把 `WEBHOOK_IMAGE` 改回仍保存在主机/镜像仓库中的上一唯一标签，再执行 `config -q` 和 `up -d --no-build --wait`。若新版本进行了旧程序不兼容的数据迁移，还必须在服务停止时恢复升级前的完整 SQLite 备份；这会丢弃备份之后收到的事件，应先评估影响。
+自有配置/脚本的更新按第 4 节使用新标签构建，然后 `up --no-build`。回滚时，把 `WEBHOOK_IMAGE` 改为记录的上一 digest 或已验证提交标签，再执行 `config -q`、必要的 `pull` 和 `up -d --no-build --wait`；不能通过再次填写可更新的 `1.0.0` 找回旧产物。若新版本进行了旧程序不兼容的数据迁移，还必须在服务停止时恢复升级前的完整 SQLite 备份；这会丢弃备份之后收到的事件，应先评估影响。
 
-从曾经把 action URL 展开后写入 SQLite 的版本升级时，新版本会用当前环境变量把可识别凭据替换回 `${secret:NAME}` 引用，但历史备份不会被自动修改。完成升级并核验后，应轮换 Telegram、飞书、钉钉等旧 token，并按保留策略安全处理旧备份。
+从曾经把 action URL 展开后写入 SQLite 的版本升级时，新版本会用当前环境变量把可识别凭据替换回 `${secret:NAME}` 引用。该迁移按稳定主键分页，每批最多 128 行和 1 MiB；超过预算的最大单条快照需单独载入。历史备份不会被自动修改，完成升级并核验后应按实际情况轮换旧凭据和处理旧备份。
+
+本次升级还需注意：policy 指标从原 `value` 标签改为固定 `reason="allowlist_rejected"`；`max_retry_age` 会在派发前拒绝已到期的 pending/retrying 动作，包括尚未首试的积压，人工 replay 重新起算；HTTP 三个执行身份头由持久元数据设置，消息变量的脱敏结果在重试/replay 中保持不变。完整修复清单见 [CHANGELOG.md](CHANGELOG.md)。
 
 不要执行 `docker compose down -v`。容器资源限制不限制 bind mount 的数据量，仍需监控磁盘、备份和执行 `store.retention` 保留策略。
 
 关停语义：Compose `stop_grace_period`（默认 45s）内应用会停止接受新请求并停止认领新任务；超时取消的 in-flight 事件会回退为 `pending` 以便重启后继续处理，不会写成终态 `partial`。长耗时 `exec`（如 300s）不保证在单次关停窗口内跑完。
+
+exec 取消或退出后，额外输出管道等待最多 250ms；已用 `setsid` 脱离进程组的后代仍需脚本或容器生命周期负责清理。常规测试、真实进程 kill/restart 与关停测试、Kuma 容器测试的命令见 [README](README.md#构建测试与发布)。

@@ -45,6 +45,7 @@ func recordingServer(t *testing.T, status int) (*httptest.Server, *[]*http.Reque
 		req.Body = io.NopCloser(strings.NewReader(string(body)))
 		reqs = append(reqs, req)
 		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"ok":true}`)
 	}))
 	t.Cleanup(srv.Close)
 	return srv, &reqs
@@ -204,8 +205,8 @@ func TestRedirectIsNotFollowed(t *testing.T) {
 	if leaked.Load() {
 		t.Fatal("redirect was followed; token header may have leaked")
 	}
-	if m.LastSuccess() == 0 {
-		t.Error("3xx (unfollowed) should count as success")
+	if m.LastSuccess() != 0 {
+		t.Error("unfollowed redirects must not count as delivered heartbeats")
 	}
 }
 

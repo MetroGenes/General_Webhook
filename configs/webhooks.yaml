@@ -2,6 +2,11 @@ server:
   addr: ":8080"
   max_in_flight: 16
   max_in_flight_bytes: 33554432  # 32 MiB
+  rate_limit:
+    pre_auth_per_ip: {burst: 120, per_second: 20} # 鉴权前按 IP 保护
+    global: {burst: 120, per_second: 2}          # 仅通过来源鉴权后消费
+    source_per_ip: {burst: 30, per_second: 0.5}
+    admin_per_ip: {burst: 60, per_second: 1}
   # 标准部署没有入站反代，保持未配置。仅在批准的内部 relay 使用固定地址时，
   # 才填写该 relay 的精确 IP/CIDR，不要直接信任整个私网网段。
   # trusted_proxies:
@@ -25,24 +30,28 @@ queue:
   max_retries: 2        # 首次尝试之后最多再重试 2 次（总计 3 次）
   retry_base: 1s
   max_retry_delay: 15m
-  max_retry_age: 24h
+  max_retry_age: 24h     # 到期的 pending/retrying 动作不再派发；人工 replay 重新起算
 
 # Deadman 心跳 (可选, 默认关闭): 进程周期性向外部监控端点 POST 存活信号。
 # 标准部署不发布宿主端口, 外部探针无法入站访问 /readyz, 因此由进程自己
-# 主动外推心跳 (Healthchecks.io / Uptime Kuma push / Cloudflare Pages 接收器)。
+# 主动向 Uptime Kuma Push 监控项报告 up/down。
 # URL/token 经环境变量提供; 全部 URL 为空时整个模块不启动 (fail closed)。
-#   - mode: push (默认): 正常 POST url, 不健康时 POST url+/fail (Healthchecks 风格)
-#   - mode: json: 始终 POST url, 负载带 status/exit_code/stats (Cloudflare 风格)
-# 只有显式设置 allow_http: true 才接受 http:// (内部 Uptime Kuma 等)。
+#   - mode: kuma (默认): query.status=up/down，且需要 2xx + {"ok":true} 确认
+#   - mode: healthchecks: 正常 POST 原路径，不健康时在路径末尾追加 /fail
+#     旧 mode: push 保留为 healthchecks 别名；UUID URL 为 https://hc-ping.com/<uuid>
+#   - mode: json: 始终 POST 原 URL，负载带 status/exit_code/stats
+# 最多 16 个独立 target worker；host 最多 128 字节。
+# 使用内部 http:// Kuma 时，把 allow_http 改为 true，并重新构建自有标签镜像。
 heartbeat:
   interval: 60s
   timeout: 10s
   host: ${HOST_LABEL}
   targets:
-    - name: healthchecks
-      url: ${HEARTBEAT_URL}
+    - name: kuma
+      url: ${HEARTBEAT_URL} # Kuma 生成的 https://.../api/push/<token>?status=up&msg=OK&ping=
       token: ${HEARTBEAT_TOKEN}
-      mode: push
+      mode: kuma
+      allow_http: false
     - name: cf-pages
       url: ${CF_HEARTBEAT_URL}
       token: ${CF_HEARTBEAT_TOKEN}
@@ -51,12 +60,14 @@ heartbeat:
 sources:
   # 示例 1: 内部 relay 转发的 GitHub push, HMAC 校验, 通知飞书 + 转发自定义服务
   # 默认 Docker 部署不接受公网 GitHub 直连，也不要为此添加宿主端口。
-  # GitHub 兼容：HMAC 仅签名 body；须带 delivery id + timestamp；同 body 在 replay 窗口内去重。
+  # relay 必须用共享 secret 对 timestamp + "\n" + delivery_id + "\n" + 原始 body 重签。
+  # 升级旧 relay 时同步改签名；如需保留仅 body 签名，显式设 signed_headers: []。
   - name: github
     auth:
       type: hmac
       header: X-Hub-Signature-256
       secret: ${GITHUB_SECRET}
+      signed_headers: [timestamp, delivery_id, body]
     extract:                       # 变量名 -> JSONPath
       event:  "$.action"
       branch: "$.ref"

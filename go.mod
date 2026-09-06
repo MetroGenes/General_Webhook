@@ -1,6 +1,6 @@
 module github.com/MetroGenes/General_Webhook
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/tidwall/gjson v1.18.0

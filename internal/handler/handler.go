@@ -15,6 +15,26 @@ type Result struct {
 	Detail string // 简要详情 (响应码 / 输出)
 }
 
+// ExecutionMetadata is trusted delivery identity from the durable event/action
+// state. It is separate from template values, which may contain user input and
+// be redacted. The event/action identity stays fixed across retries and replay.
+type ExecutionMetadata struct {
+	EventID     string
+	ActionIndex int
+	Attempt     int
+}
+
+type executionMetadataKey struct{}
+
+func WithExecutionMetadata(ctx context.Context, meta ExecutionMetadata) context.Context {
+	return context.WithValue(ctx, executionMetadataKey{}, meta)
+}
+
+func ExecutionMetadataFrom(ctx context.Context) (ExecutionMetadata, bool) {
+	meta, ok := ctx.Value(executionMetadataKey{}).(ExecutionMetadata)
+	return meta, ok
+}
+
 // Handler 执行一种动作类型。
 type Handler interface {
 	Type() string

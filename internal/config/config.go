@@ -43,7 +43,7 @@ type HeartbeatTarget struct {
 	Name      string `yaml:"name"`       // 日志标识, 必须是 [a-zA-Z0-9_-]{1,64}
 	URL       string `yaml:"url"`        // 死链 push URL, 默认要求 https
 	Token     string `yaml:"token"`      // 可选; 非空时作为 X-Heartbeat-Token 头发送
-	Mode      string `yaml:"mode"`       // push(默认) | json
+	Mode      string `yaml:"mode"`       // kuma(default) | healthchecks | push(legacy) | json
 	AllowHTTP bool   `yaml:"allow_http"` // 显式允许 http:// URL (内部 Uptime Kuma 等)
 }
 
@@ -55,10 +55,11 @@ type AdminConfig struct {
 }
 
 type ServerConfig struct {
-	Addr             string   `yaml:"addr"`
-	TrustedProxies   []string `yaml:"trusted_proxies"`
-	MaxInFlight      int      `yaml:"max_in_flight"`
-	MaxInFlightBytes int      `yaml:"max_in_flight_bytes"`
+	Addr             string           `yaml:"addr"`
+	TrustedProxies   []string         `yaml:"trusted_proxies"`
+	MaxInFlight      int              `yaml:"max_in_flight"`
+	MaxInFlightBytes int              `yaml:"max_in_flight_bytes"`
+	RateLimit        RateLimitsConfig `yaml:"rate_limit"`
 }
 
 type LogConfig struct {
@@ -165,11 +166,7 @@ func (d *Duration) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
-var (
-	envBraceRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
-	envPlainRe = regexp.MustCompile(`\$([A-Za-z_][A-Za-z0-9_]*)`)
-	envPrefRe  = regexp.MustCompile(`\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}`)
-)
+var configEnvRe = regexp.MustCompile(`\$\{(?:ENV:)?([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)`)
 
 // Load 读取配置文件并校验。
 // 配置层 env 展开：已设置的 ${NAME} / $NAME / ${ENV:NAME} 会替换；未设置的 ${var} 保留给运行时。
@@ -218,8 +215,14 @@ func Load(path string) (*Config, error) {
 // expandConfigEnv replaces env placeholders. If requireSet, missing env becomes empty (secrets).
 // Otherwise missing ${name} is preserved for runtime event interpolation.
 func expandConfigEnv(s string, requireSet bool) string {
-	s = envPrefRe.ReplaceAllStringFunc(s, func(m string) string {
-		key := envPrefRe.FindStringSubmatch(m)[1]
+	// Only match the original configuration text. Returned environment values
+	// are literal data, including any dollar signs they contain.
+	return configEnvRe.ReplaceAllStringFunc(s, func(m string) string {
+		match := configEnvRe.FindStringSubmatch(m)
+		key := match[1]
+		if key == "" {
+			key = match[2]
+		}
 		if v, ok := os.LookupEnv(key); ok {
 			return v
 		}
@@ -228,30 +231,10 @@ func expandConfigEnv(s string, requireSet bool) string {
 		}
 		return m
 	})
-	s = envBraceRe.ReplaceAllStringFunc(s, func(m string) string {
-		key := envBraceRe.FindStringSubmatch(m)[1]
-		if v, ok := os.LookupEnv(key); ok {
-			return v
-		}
-		if requireSet {
-			return ""
-		}
-		return m // keep for runtime ${var}
-	})
-	s = envPlainRe.ReplaceAllStringFunc(s, func(m string) string {
-		key := envPlainRe.FindStringSubmatch(m)[1]
-		if v, ok := os.LookupEnv(key); ok {
-			return v
-		}
-		if requireSet {
-			return ""
-		}
-		return m
-	})
-	return s
 }
 
 func (c *Config) applyDefaults() {
+	c.Server.RateLimit = c.Server.RateLimit.WithDefaults()
 	if c.Server.Addr == "" {
 		c.Server.Addr = ":8080"
 	}
@@ -303,12 +286,15 @@ func (c *Config) applyDefaults() {
 	}
 	for i := range c.Heartbeat.Targets {
 		if strings.TrimSpace(c.Heartbeat.Targets[i].Mode) == "" {
-			c.Heartbeat.Targets[i].Mode = "push"
+			c.Heartbeat.Targets[i].Mode = "kuma"
 		}
 	}
 }
 
 func (c *Config) validate() error {
+	if err := c.Server.RateLimit.validate(); err != nil {
+		return err
+	}
 	if c.Admin.Token != "" && len(c.Admin.Token) < minSecretLen {
 		return fmt.Errorf("admin.token must be at least %d bytes", minSecretLen)
 	}
@@ -500,8 +486,8 @@ func (c *Config) validateHeartbeat() error {
 	if hb.Timeout.Duration > hb.Interval.Duration {
 		return fmt.Errorf("heartbeat.timeout must not exceed heartbeat.interval")
 	}
-	if strings.TrimSpace(hb.Host) == "" {
-		return fmt.Errorf("heartbeat.host must not be empty")
+	if strings.TrimSpace(hb.Host) == "" || len(hb.Host) > 128 {
+		return fmt.Errorf("heartbeat.host must contain 1..128 bytes")
 	}
 	for _, r := range hb.Host {
 		if r < 0x20 || r == 0x7f {
@@ -509,6 +495,9 @@ func (c *Config) validateHeartbeat() error {
 		}
 	}
 	seen := map[string]bool{}
+	if len(hb.Targets) > 16 {
+		return fmt.Errorf("heartbeat.targets must contain at most 16 targets")
+	}
 	for i, t := range hb.Targets {
 		if t.Name == "" {
 			return fmt.Errorf("heartbeat.targets[%d]: name is required", i)
@@ -523,7 +512,10 @@ func (c *Config) validateHeartbeat() error {
 
 		u, err := url.Parse(t.URL)
 		if err != nil || u.Scheme == "" || u.Host == "" {
-			return fmt.Errorf("heartbeat.targets[%d]: invalid url %q", i, t.URL)
+			return fmt.Errorf("heartbeat.targets[%d]: invalid url", i)
+		}
+		if len(t.URL) > 4096 || u.Fragment != "" || u.Opaque != "" {
+			return fmt.Errorf("heartbeat.targets[%d]: url must be at most 4096 bytes without a fragment or opaque path", i)
 		}
 		scheme := strings.ToLower(u.Scheme)
 		if scheme != "https" && !(scheme == "http" && t.AllowHTTP) {
@@ -533,9 +525,9 @@ func (c *Config) validateHeartbeat() error {
 			return fmt.Errorf("heartbeat.targets[%d]: url must not contain userinfo", i)
 		}
 		switch t.Mode {
-		case "push", "json":
+		case "kuma", "healthchecks", "push", "json":
 		default:
-			return fmt.Errorf("heartbeat.targets[%d]: unknown mode %q (push/json)", i, t.Mode)
+			return fmt.Errorf("heartbeat.targets[%d]: unknown mode (use kuma, healthchecks, push or json)", i)
 		}
 	}
 	return nil
